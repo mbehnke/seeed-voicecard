@@ -162,9 +162,18 @@ install_module "./" "seeed-voicecard"
 
 
 # install dtbos
-cp seeed-2mic-voicecard.dtbo $OVERLAYS
-cp seeed-4mic-voicecard.dtbo $OVERLAYS
-cp seeed-8mic-voicecard.dtbo $OVERLAYS
+# Detect Pi 5 (BCM2712) vs older models
+if grep -q "bcm2712" /proc/cpuinfo; then
+  echo "Detected Raspberry Pi 5 (BCM2712)"
+  # For Pi 5, compile the rpi5-specific overlays
+  ./builddtbo.sh seeed-4mic-voicecard-rpi5
+  cp seeed-4mic-voicecard-rpi5.dtbo $OVERLAYS
+else
+  echo "Detected Raspberry Pi 4 or earlier"
+  cp seeed-2mic-voicecard.dtbo $OVERLAYS
+  cp seeed-4mic-voicecard.dtbo $OVERLAYS
+  cp seeed-8mic-voicecard.dtbo $OVERLAYS
+fi
 
 #install alsa plugins
 # no need this plugin now
@@ -191,6 +200,20 @@ grep -q "^dtoverlay=i2s-mmap$" $CONFIG || \
 
 grep -q "^dtparam=i2s=on$" $CONFIG || \
   echo "dtparam=i2s=on" >> $CONFIG
+
+# Configure correct overlay for Pi 5 vs Pi 4
+if grep -q "bcm2712" /proc/cpuinfo; then
+  # Pi 5 specific overlay configuration
+  grep -q "^dtoverlay=seeed-4mic-voicecard-rpi5$" $CONFIG || {
+    # Remove old overlay if present
+    sed -i '/^dtoverlay=seeed-4mic-voicecard[^-]/d' $CONFIG || true
+    echo "dtoverlay=seeed-4mic-voicecard-rpi5" >> $CONFIG
+  }
+else
+  # Pi 4 and earlier - use standard overlay
+  grep -q "^dtoverlay=seeed-4mic-voicecard$" $CONFIG || \
+    echo "dtoverlay=seeed-4mic-voicecard" >> $CONFIG
+fi
 
 #install config files
 mkdir /etc/voicecard || true
