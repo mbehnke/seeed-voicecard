@@ -1,108 +1,196 @@
-# seeed-voicecard AI Coding Instructions
+# **Seeed 4-Mic Array (RPi 5 / Kernel 6.x) – AI Coding Instructions**
 
-## Project Overview
-This is a Linux kernel driver package for Seeed ReSpeaker microphone array cards (2, 4, 6, 8-mic variants) on Raspberry Pi. It consists of kernel modules, ALSA plugins, device tree overlays, and audio configuration.
+## **Project Overview**
+Linux kernel driver for **Seeed ReSpeaker 4-Mic Array** on **Raspberry Pi 5 (Kernel 6.x)**.
+**Key Components**:
+- **Kernel Modules**: `snd-soc-ac108.ko` (AC108 codec), `snd-soc-seeed-voicecard.ko` (machine driver)
+- **ALSA Plugin**: `ac108_plugin/` for multi-channel capture
+- **Device Tree Overlays**: Configures I2S/I2C for AC108
+- **Audio Configs**: `asound_4mic.conf` for ALSA routing
 
-## Architecture
+---
 
-### Core Components
-- **Kernel Modules** (built via DKMS): `snd-soc-wm8960.ko` (WM8960 codec), `snd-soc-ac108.ko` (AC108 multichannel codec), `snd-soc-seeed-voicecard.ko` (main machine driver)
-- **ALSA Plugin** (`ac108_plugin/`): userspace PCM plugin compiled as `.so` for AC108 capture support
-- **Device Tree Overlays** (`.dts`): Configures I2C codec addresses, I2S pins, MCLK clocks, and audio routing per variant
-- **Audio Configs** (`asound_*.conf`): ALSA daemon configuration with channel routing and mixer settings
+## **Architecture**
+### **Core Components**
+| Component               | File                     | Purpose                                                                 |
+|-------------------------|--------------------------|-------------------------------------------------------------------------|
+| **Machine Driver**      | `seeed-voicecard.c`      | Binds CPU DAI (I2S) to AC108 codec, manages clock/startup sequences      |
+| **AC108 Codec Driver**  | `ac108.c`               | Multi-channel ADC with PLL, register maps, and capture configuration  |
+| **Device Tree Overlay** | `seeed-4mic-voicecard-rpi5-overlay.dts` | Configures I2S, I2C, MCLK, and audio routing for RPi 5               |
+| **ALSA Plugin**         | `ac108_plugin/`         | Userspace PCM plugin for AC108 capture support                         |
 
-### Key Files
-- [seeed-voicecard.c](../seeed-voicecard.c#L1): Machine driver - binds CPU DAI (I2S) to codecs, manages clock hierarchy and startup sequences
-- [ac108.c](../ac108.c#L1): AC108 codec driver - multi-channel ADC with PLL, register maps, and capture channel configuration
-- [ac101.c](../ac101.c#L1): AC101 codec driver - used in 6-mic variant as slave codec
-- [wm8960.c](../wm8960.c#L1): WM8960 codec driver - low-power stereo codec for 2-mic variant
-- [ac10x.h](../ac10x.h#L1): Shared codec configuration flags (e.g., `CONFIG_AC101_SWITCH_DETECT`, `CONFIG_AC10X_TRIG_LOCK`)
-- [seeed-2mic-voicecard-overlay.dts](../seeed-2mic-voicecard-overlay.dts): Device tree template; adapt for other variants
+### **Data Flow**
+1. **User App** → ALSA (`/dev/snd/pcm*`)
+2. **ALSA Core** → `seeed-voicecard` machine driver
+3. **Machine Driver** → AC108 codec (I2C control, I2S data)
+4. **AC108** → Multi-channel audio → ALSA plugin → Userspace
 
-### Data Flow
-1. User records audio → ALSA app reads `/dev/snd/pcm*` 
-2. Linux ALSA core → seeed-voicecard machine driver
-3. Machine driver → routes to codec(s) via DAI link (I2C control, I2S data)
-4. Codec(s) perform audio I/O via I2C (registers) and I2S (samples)
-5. Multi-channel data → ALSA plugin reorders channels if needed → userspace
+---
 
-## Build & Install Workflow
+## **RPi 5 / Kernel 6.x Specifics**
+### **Critical Checks**
+| Area                     | Issue                                                                 | Fix                                                                                     |
+|--------------------------|-----------------------------------------------------------------------|----------------------------------------------------------------------------------------|
+| **Kernel Compatibility** | ASoC API changes (e.g., `snd_soc_dai_set_fmt`, `devm_*` functions)     | Update driver to use `devm_snd_soc_register_card` and modern ASoC APIs.               |
+| **I2S Format Support**   | RPi 5’s `designware-i2s` **does not support `DSP_A` (TDM)**            | Force `simple-audio-card,format = "i2s"` in DTS. Use software channel multiplexing.      |
+| **Clock Configuration**  | AC108 requires **24 MHz MCLK**, but RPi 5 uses different clock sources | Define `fixed-clock` in DTS: `ac108_mclk: clock-frequency = <24000000>;`.               |
+| **Device Tree Bindings** | RPi 5 uses **new bindings** (`brcm,bcm2712-i2s`, `rp1-i2c`)             | Update DTS `compatible` strings and node paths.                                       |
+| **I2C/I2S Node Status**  | Nodes may be **disabled** (`status = "disabled"`)                     | Ensure `status = "okay"` in DTS for `&i2s` and `&i2c1`.                               |
+| **ALSA Routing**         | Gerätename may change (e.g., `seeed4micvoicec` → `card0`)            | Adapt `/etc/asound.conf` to match actual device name.                                  |
 
-### Normal Build (DKMS Auto-patching)
+---
+
+## **Build & Install Workflow**
+### **1. DKMS Build (Recommended)**
 ```bash
-# install.sh handles everything: kernel header checks, DKMS setup, dtbo compilation
-sudo ./install.sh  # patches kernel version mismatches, compiles .ko + .dtbo, installs + loads modules
+sudo ./install.sh  # Auto-detects RPi 5, applies patches, compiles .ko + .dtbo
 sudo reboot
 ```
-- **Why DKMS**: Survives kernel updates; patches applied per version in `dkms.conf` (4.19, 5.4, 5.8 patterns)
-- **Kernel Compatibility**: Checks `/lib/modules/$(uname -r)/build/` and applies matching `patches/*.diff` to adapt ASoC simple-card APIs
+- **Why DKMS?**: Survives kernel updates; applies version-specific patches from `patches/`.
 
-### Manual Build (Development)
+### **2. Manual Build (Debugging)**
 ```bash
 make clean
-make DEBUG=1          # Enables AC108 debug logging via dmesg
-sudo make install     # Copies .ko to /lib/modules/.../kernel/sound/soc/{codecs,bcm}/
+make DEBUG=1  # Enables AC108 debug logs (check `dmesg`)
+sudo make install
 sudo depmod -a && modprobe snd_soc_seeed_voicecard
 ```
 
-### Device Tree Overlay Build
+### **3. Device Tree Overlay**
 ```bash
-./builddtbo.sh seeed-2mic-voicecard  # Compiles .dts→.dtbo using dtc
-# Verify: dtoverlay -l | grep seeed
+# Compile DTS → DTBO
+dtc -I dts -O dtb -o seeed-4mic-voicecard-rpi5.dtbo seeed-4mic-voicecard-rpi5-overlay.dts
+
+# Merge into RPi 5 DTB (avoids runtime overlay issues)
+sudo fdtoverlay -i /boot/firmware/bcm2712-rpi-5-b.dtb -o /boot/firmware/bcm2712-rpi-5-b.dtb.merged seeed-4mic-voicecard-rpi5.dtbo
+sudo cp /boot/firmware/bcm2712-rpi-5-b.dtb{.merged,}
+sudo reboot
 ```
 
-## Codec & Channel Mapping Patterns
-
-### AC108 (4, 6, 8-mic captures)
-- PLL divider lookup table: [ac108.c L97-102](../ac108.c#L97)
-- Sample rate map: 8kHz→0, 16kHz→3, 48kHz→8 (register value, not rate in Hz)
-- Channel defaults: 4-mic=4ch, 6-mic=6ch, 8-mic=8ch (per variant DTS)
-- Overrides in [seeed-voicecard.c](../seeed-voicecard.c#L73): `channels_capture_override` if set non-zero
-- I2C slave address: typically 0x35 (configurable in DTS)
-
-### WM8960 (stereo codec, 2-mic variant)
-- Stereo only; gains controlled via ALSA mixer `LINPUT1/3`, `RINPUT1/2`
-- MCLK requirement: 12.288 MHz (fixed in DTS), generated by `wm8960_mclk` fixed-clock node
-
-### Audio Routing (DTS level)
-Device tree specifies input/output paths:
+---
+## **Device Tree Overlay (RPi 5)**
+### **Current DTS (`seeed-4mic-voicecard-rpi5-overlay.dts`)**
 ```dts
-simple-audio-card,routing = "Headphone Jack", "HP_L", ... "LINPUT1", "Mic Jack";
+/dts-v1/;
+/plugin/;
+
+/ {
+    compatible = "brcm,bcm2712";
+
+    fragment@0 {
+        target = <&i2s>;  // RPi 5 I2S node
+        __overlay__ {
+            status = "okay";
+        };
+    };
+
+    fragment@1 {
+        target-path = "/";
+        __overlay__ {
+            ac108_mclk: codec-mclk {
+                compatible = "fixed-clock";
+                #clock-cells = <0>;
+                clock-frequency = <24000000>;  // AC108 requires 24 MHz
+            };
+        };
+    };
+
+    fragment@2 {
+        target = <&i2c1>;  // RPi 5 I2C node
+        __overlay__ {
+            #address-cells = <1>;
+            #size-cells = <0>;
+            status = "okay";
+
+            ac108: ac108@3b {
+                compatible = "x-power,ac108";
+                reg = <0x3b>;
+                #sound-dai-cells = <0>;
+            };
+        };
+    };
+
+    fragment@3 {
+        target-path = "/";
+        __overlay__ {
+            sound {
+                compatible = "simple-audio-card";
+                simple-audio-card,name = "seeed-4mic-voicecard";
+                simple-audio-card,format = "i2s";  // RPi 5 does NOT support DSP_A
+                status = "okay";
+
+                simple-audio-card,cpu {
+                    sound-dai = <&i2s>;
+                };
+
+                simple-audio-card,codec {
+                    sound-dai = <&ac108>;
+                    clocks = <&ac108_mclk>;
+                    clock-names = "mclk";
+                };
+            };
+        };
+    };
+};
 ```
-Changes require recompilation of `.dtbo` and device tree reboot.
 
-## Common Issues & Development Notes
+### **Key Notes**
+- **`simple-audio-card,format = "i2s"`**: RPi 5’s `designware-i2s` **does not support `DSP_A`**.
+- **`ac108_mclk`**: **24 MHz fixed clock** required for AC108.
+- **Labels (`&i2s`, `&i2c1`)**: Use **symbolic references** (not full paths) to avoid DTC errors.
 
-- **CONFIG_AC101_SWITCH_DETECT** [ac10x.h L30](../ac10x.h#L30): Enables headset jack detection in AC101; toggle to disable if causing issues
-- **Channel override pattern**: Useful for testing; set `channels_capture_override` in DTS to force mono/stereo on multi-mic cards
-- **I2C probe failures**: Verify codec address in DTS matches hardware (I2C scan: `i2cdetect -y 1`)
-- **Clock tree debugging**: Check `clk_summary` in sysfs if audio distortion occurs; ensure MCLK divides cleanly to sample rate
-- **ALSA plugin versioning**: `.so` in `ac108_plugin/` compiled against alsa-lib version; rebuild if plugin not found at runtime
-
-## Testing & Verification
-
-### Audio Capture Test
+---
+## **Testing & Debugging**
+### **1. Verify Hardware**
 ```bash
-arecord -D hw:seeed2micvoicecard,0 -f S16_LE -r 16000 -c 2 test.wav  # 2-mic
-arecord -D hw:seeed4micvoicecard,0 -f S16_LE -r 16000 -c 4 test.wav  # 4-mic
-# Verify channels: sox test.wav -n stat (output shows channels)
+# Check I2C (AC108 should appear at 0x3b)
+i2cdetect -y 1
+
+# Check ALSA devices
+arecord -l  # Should list "seeed-4mic-voicecard"
 ```
 
-### Coherence Analysis (multi-mic)
+### **2. Test Recording**
 ```bash
-python3 tools/coherence.py test.wav  # Plots phase coherence between mic pairs; validates hardware sync
+# Record 4 channels @ 16kHz
+arecord -D hw:0,0 -f S16_LE -r 16000 -c 4 -d 5 test.wav
+
+# Verify channels (non-zero samples)
+sox test.wav -n stat
 ```
 
-### Mixer Inspection
+### **3. Debug Kernel Issues**
 ```bash
-alsamixer -c seeed2micvoicecard  # GUI; or
-amixer -c seeed2micvoicecard contents | grep -i ac108
+# Check for errors
+dmesg | grep -E "ac108|i2s|sound|asoc"
+
+# Check clock tree
+cat /sys/kernel/debug/clk/clk_summary | grep -i i2s
 ```
 
-## Editing Checklist for Common Tasks
+---
+## **Common Issues & Fixes**
+| Issue                                  | Cause                                                                 | Fix                                                                                     |
+|----------------------------------------|-----------------------------------------------------------------------|----------------------------------------------------------------------------------------|
+| **`deferred probe pending`**           | Missing dependencies (e.g., I2C not ready)                          | Ensure `status = "okay"` for `&i2c1` and `&i2s` in DTS.                                |
+| **`ASoC: error at snd_soc_dai_set_fmt`** | RPi 5 I2S rejects `DSP_A` format                                    | Use `simple-audio-card,format = "i2s"` in DTS.                                         |
+| **No sound (zero samples)**            | Wrong ALSA device name or muted channels                            | Check `arecord -l`, set gains: `amixer -c 0 sset 'ADC1 PGA gain' 31`.                  |
+| **I2C probe fails**                    | AC108 not detected at 0x3b                                           | Verify wiring, run `i2cdetect -y 1`.                                                   |
+| **Clock issues (distorted audio)**    | MCLK not configured or wrong frequency                              | Define `ac108_mclk` in DTS with `clock-frequency = <24000000>`.                       |
 
-1. **Add support for new codec**: Create `newcodec.c/.h`, register in machine driver DAI link, update dkms.conf module list
-2. **Tune channel count**: Modify DTS `channels_playback/capture_default`, or runtime override in seeed-voicecard.c
-3. **Fix clock divider issue**: Adjust PLL lookup table (ac108.c or wm8960.c) and test with known sample rate
-4. **Port to new kernel**: Add new `.diff` patch in `patches/` and version pattern in `dkms.conf`
-5. **Update ALSA routing**: Edit `.dts` route section, recompile `.dtbo`, test with `alsamixer`
+---
+## **Editing Checklist**
+1. **Add new codec**: Create `newcodec.c`, register in `seeed-voicecard.c`, update `dkms.conf`.
+2. **Fix clock issues**: Adjust PLL tables in `ac108.c` for sample rate compatibility.
+3. **Port to new kernel**: Add patch in `patches/` for Kernel 6.x ASoC API changes.
+4. **Update routing**: Edit DTS `simple-audio-card,routing`, recompile `.dtbo`.
+5. **Debug silence**: Check `amixer` gains, test with `arecord`, analyze `sox test.wav -n stat`.
+
+---
+### **Final Notes**
+- **RPi 5 Limitations**: No `DSP_A` support → Use `i2s` + software channel routing.
+- **Always merge overlays into DTB** (avoids runtime overlay issues).
+- **Check `dmesg` first** for errors like `deferred probe` or `DAI format`.
+
+# Improvements Continue
+- where possible improve diagnose_audio.sh and pre-reboot-checks.sh scripts to cover RPi 5 specifics and Kernel 6.x changes.

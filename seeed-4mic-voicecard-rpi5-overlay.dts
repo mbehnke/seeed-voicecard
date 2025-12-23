@@ -2,67 +2,62 @@
 /plugin/;
 
 / {
-compatible = "brcm,bcm2712";
+	compatible = "brcm,bcm2712";
 
-fragment@0 {
-	target-path = "/axi/pcie@1000120000/rp1/i2s@a0000";
-	__overlay__ {
-		i2s_rp1: i2s_rp1 {
+	fragment@0 {
+		target = <&i2s>;
+		__overlay__ {
+			#sound-dai-cells = <0>;
 			status = "okay";
-			#sound-dai-cells = <0>;
 		};
 	};
-};
 
-fragment@1 {
-target-path = "/";
-__overlay__ {
-ac108_mclk: codec-mclk {
-compatible = "fixed-clock";
-#clock-cells = <0>;
-clock-frequency = <24000000>;
-};
-};
-};
-
-fragment@2 {
-	target-path = "/axi/pcie@1000120000/rp1/i2c@74000";
-	__overlay__ {
-		#address-cells = <1>;
-		#size-cells = <0>;
-		status = "okay";
-
-		ac108_a: ac108@3b {
-			compatible = "x-power,ac108_0";
-			reg = <0x3b>;
-			#sound-dai-cells = <0>;
-			data-protocol = <0>;
+	fragment@1 {
+		target-path = "/";
+		__overlay__ {
+			ac108_mclk: codec-mclk {
+				compatible = "fixed-clock";
+				#clock-cells = <0>;
+				clock-frequency = <24000000>;
+			};
 		};
 	};
-};
 
-fragment@3 {
-target-path = "/";
-__overlay__ {
-sound: sound {
-compatible = "simple-audio-card";
-simple-audio-card,name = "seeed-4mic-voicecard";
-simple-audio-card,format = "i2s";
-status = "okay";
+	fragment@2 {
+		target = <&i2c1>;
+		__overlay__ {
+			#address-cells = <1>;
+			#size-cells = <0>;
+			status = "okay";
 
-simple-audio-card,bitclock-master = <&codec_dai>;
-simple-audio-card,frame-master = <&codec_dai>;
+			ac108_a: ac108@3b {
+				compatible = "x-power,ac108_0";
+				reg = <0x3b>;
+				#sound-dai-cells = <0>;
+				data-protocol = <0>;
+			};
+		};
+	};
 
-				simple-audio-card,cpu {
-					sound-dai = <&i2s_rp1>;
+	fragment@3 {
+		target-path = "/";
+		__overlay__ {
+			sound: sound {
+				compatible = "seeed-voicecard";
+				seeed-voice-card,format = "i2s";
+				seeed-voice-card,name = "seeed-4mic-voicecard";
+				status = "okay";
+
+				seeed-voice-card,cpu {
+					sound-dai = <&i2s>;
 				};
 
-codec_dai: simple-audio-card,codec {
-sound-dai = <&ac108_a>;
-clocks = <&ac108_mclk>;
-clock-names = "mclk";
-};
-};
-};
-};
+				seeed-voice-card,codec {
+					sound-dai = <&ac108_a>;
+					clocks = <&ac108_mclk>;
+					clock-names = "mclk";
+				};
+			};
+		};
+	};
 };
