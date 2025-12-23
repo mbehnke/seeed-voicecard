@@ -2,12 +2,23 @@
 # AC108 Hardware Diagnostics for Seeed ReSpeaker
 # Checks driver status, I2C communication, and performs test recording
 
-LOG_FILE="/tmp/diagnose_audio.log"
+LOG_DIR="$(cd "$(dirname "$0")" && pwd)/logs"
+mkdir -p "$LOG_DIR"
+LOG_FILE="$LOG_DIR/diagnose_audio_$(date '+%Y%m%d_%H%M%S').log"
 run_ts="$(date '+%Y-%m-%d %H:%M:%S')"
 
 log_msg() {
+    local timestamp="[$(date '+%Y-%m-%d %H:%M:%S.%3N')]"
     echo -e "$1"
-    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" >> "$LOG_FILE"
+    echo "$timestamp $1" >> "$LOG_FILE"
+}
+
+log_cmd() {
+    local timestamp="[$(date '+%Y-%m-%d %H:%M:%S.%3N')]"
+    echo "$timestamp CMD: $1" >> "$LOG_FILE"
+    eval "$1" 2>&1 | while IFS= read -r line; do
+        echo "$timestamp OUT: $line" >> "$LOG_FILE"
+    done
 }
 
 echo "==========================================" | tee -a "$LOG_FILE"
@@ -34,26 +45,51 @@ echo "" | tee -a "$LOG_FILE"
 
 # 2. Hardware Detection
 log_msg "2️⃣  Checking Hardware Detection..."
-if arecord -l 2>&1 | tee -a "$LOG_FILE" | grep -qi seeed; then
+log_msg "   Running: arecord -l"
+arecord -l 2>&1 | while IFS= read -r line; do
+    log_msg "   $line"
+done
+if arecord -l 2>&1 | grep -qi seeed; then
     log_msg "✅ Seeed device detected by ALSA"
+    CARD_NUM=$(arecord -l | grep -i seeed | grep -oP 'card \K[0-9]+')
+    log_msg "   Card number: $CARD_NUM"
 else
     log_msg "❌ No Seeed device found"
+    log_msg "   Available cards:"
+    cat /proc/asound/cards | tee -a "$LOG_FILE"
 fi
 echo "" | tee -a "$LOG_FILE"
 
 # 3. I2C Communication
 log_msg "3️⃣  Checking I2C Communication..."
+log_msg "   Running: i2cdetect -y 1"
+i2cdetect -y 1 2>&1 | tee -a "$LOG_FILE"
 I2C_ADDR=$(i2cdetect -y 1 | grep -o "UU" | head -1)
 if [ -n "$I2C_ADDR" ]; then
     log_msg "✅ Codec responding on I2C bus 1 (address shows UU - driver in use)"
+    log_msg "   Checking I2C device binding:"
+    if [ -d /sys/bus/i2c/devices/1-003b ]; then
+        log_msg "   Device path: /sys/bus/i2c/devices/1-003b"
+        log_msg "   Driver: $(cat /sys/bus/i2c/devices/1-003b/name 2>/dev/null || echo 'N/A')"
+        log_msg "   Modalias: $(cat /sys/bus/i2c/devices/1-003b/modalias 2>/dev/null || echo 'N/A')"
+    fi
 else
     log_msg "⚠️  No codec detected on I2C bus 1"
+    log_msg "   Expected: UU at address 0x3b"
 fi
 echo "" | tee -a "$LOG_FILE"
 
 # 4. Kernel Logs Check
 log_msg "4️⃣  Recent Kernel Logs (errors/warnings)..."
-if ! dmesg | grep -iE "(ac108|seeed)" | grep -iE "(error|fail|warn)" | tail -5 | tee -a "$LOG_FILE"; then
+log_msg "   Last 10 AC108/Seeed messages:"
+dmesg | grep -iE "(ac108|seeed|asoc-simple|sound)" | tail -10 | while IFS= read -r line; do
+    log_msg "   $line"
+done
+echo "" | tee -a "$LOG_FILE"
+log_msg "   Filtering errors/warnings:"
+if dmesg | grep -iE "(ac108|seeed)" | grep -iE "(error|fail|warn)" | tail -5 | tee -a "$LOG_FILE"; then
+    log_msg "⚠️  Errors found in kernel logs (see above)"
+else
     log_msg "✅ No errors in kernel logs"
 fi
 echo "" | tee -a "$LOG_FILE"
@@ -136,11 +172,46 @@ echo "" | tee -a "$LOG_FILE"
 
 # 9. Device Tree Check
 log_msg "9️⃣  Checking Device Tree Overlay..."
-if dtoverlay -l | tee -a "$LOG_FILE" | grep -qi seeed; then
+log_msg "   Running: dtoverlay -l"
+dtoverlay -l | tee -a "$LOG_FILE"
+if dtoverlay -l | grep -qi seeed; then
     log_msg "✅ Seeed overlay loaded"
 else
-    log_msg "⚠️  No seeed overlay in dtoverlay list"
-    log_msg "   Check /boot/firmware/config.txt for dtoverlay=seeed-*mic-voicecard"
+    log_msg "⚠️  No seeed overlay in dtoverlay list (may be merged into DTB)"
+    log_msg "   Checking if sound node exists in device tree:"
+    if [ -d /proc/device-tree/sound ]; then
+        log_msg "   ✅ /proc/device-tree/sound exists"
+        COMPAT=$(tr '\0' ' ' < /proc/device-tree/sound/compatible 2>/dev/null)
+        log_msg "   Compatible: $COMPAT"
+        NAME=$(tr '\0' ' ' < /proc/device-tree/sound/seeed-voice-card,name 2>/dev/null || tr '\0' ' ' < /proc/device-tree/sound/simple-audio-card,name 2>/dev/null || echo "N/A")
+        log_msg "   Card name: $NAME"
+    else
+        log_msg "   ❌ /proc/device-tree/sound NOT found"
+    fi
+fi
+echo "" | tee -a "$LOG_FILE"
+
+# 10. Codec Register Dump
+log_msg "🔟 Checking Codec Register Status..."
+if command -v i2cdump &> /dev/null; then
+    log_msg "   Dumping AC108 registers (I2C 0x3b):"
+    if ! i2cdump -y 1 0x3b 2>&1 | head -20 | tee -a "$LOG_FILE"; then
+        log_msg "   ⚠️  i2cdump failed (bus busy or permission)"
+    fi
+else
+    log_msg "   ⚠️  i2cdump not available (install i2c-tools)"
+fi
+echo "" | tee -a "$LOG_FILE"
+
+# 11. ALSA Controls Check
+log_msg "1️⃣1️⃣  ALSA Control Interface..."
+if amixer -c 0 contents 2>&1 | grep -qi ac108; then
+    log_msg "✅ AC108 controls found"
+    log_msg "   Total controls: $(amixer -c 0 controls | wc -l)"
+    log_msg "   First controls:" 
+    amixer -c 0 scontrols 2>&1 | head -5 | while IFS= read -r line; do log_msg "   $line"; done
+else
+    log_msg "⚠️  No AC108 controls found"
 fi
 echo "" | tee -a "$LOG_FILE"
 

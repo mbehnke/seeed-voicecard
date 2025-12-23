@@ -46,13 +46,23 @@
 				compatible = "seeed-voicecard";
 				seeed-voice-card,format = "i2s";
 				seeed-voice-card,name = "seeed-4mic-voicecard";
+				seeed-voice-card,channels-playback-override = <2>;
+				seeed-voice-card,channels-capture-override = <4>;
 				status = "okay";
 
-				seeed-voice-card,cpu {
+				/* On RPi 5 designware-i2s must be master */
+				seeed-voice-card,bitclock-master = <&cpu_dai>;
+				seeed-voice-card,frame-master = <&cpu_dai>;
+
+				cpu_dai: seeed-voice-card,cpu {
 					sound-dai = <&i2s>;
+					dai-tdm-slot-num = <2>;
+					dai-tdm-slot-width = <32>;
+					dai-tdm-slot-tx-mask = <1 1 0 0>;
+					dai-tdm-slot-rx-mask = <1 1 0 0>;
 				};
 
-				seeed-voice-card,codec {
+				codec_dai: seeed-voice-card,codec {
 					sound-dai = <&ac108_a>;
 					clocks = <&ac108_mclk>;
 					clock-names = "mclk";
