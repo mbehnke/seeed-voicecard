@@ -10,6 +10,26 @@ cd seeed-voicecard
 sudo ./install.sh
 sudo reboot
 ```
+
+**For Raspberry Pi 5 with kernel 6.12+:**
+The installation process is the same as above. The installer will automatically:
+- Detect your kernel version (6.12+)
+- Install appropriate kernel headers (raspberrypi-kernel-headers or linux-headers-raspi)
+- Build and install drivers using DKMS for your specific kernel
+- Install updated device tree overlays with BCM2712 support
+- Configure the audio system for your ReSpeaker device
+
+After reboot, verify the installation:
+```bash
+# Check if the driver modules are loaded
+lsmod | grep snd_soc
+
+# For 4-Mic Array, check if the device is detected
+arecord -l | grep seeed4micvoicec
+
+# Test recording (4-Mic Array example)
+arecord -Dhw:seeed4micvoicec -f S32_LE -r 16000 -c 4 test.wav
+```
 ## ReSpeaker Documentation
 
 Up to date documentation for reSpeaker products can be found in [Seeed Studio Wiki](https://wiki.seeedstudio.com/ReSpeaker/)!
