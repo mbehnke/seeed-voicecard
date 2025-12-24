@@ -194,3 +194,35 @@ cat /sys/kernel/debug/clk/clk_summary | grep -i i2s
 
 # Improvements Continue
 - where possible improve diagnose_audio.sh and pre-reboot-checks.sh scripts to cover RPi 5 specifics and Kernel 6.x changes.
+
+scripte und logs vorerst nicht in tmp sondern in das projekt verzeichnis
+und auch ein eraly boot analyse script hinzufügen mit logs in das projekt verzeichnis
+
+*"Generate a minimal, machine-readable JSON output for script analysis. Include only:
+- **status** (success/error),
+- **error_code** (if applicable),
+- **key_metrics** (e.g., device detection, I2C status, ALSA controls),
+- **root_cause** (single-line technical summary),
+- **required_actions** (array of commands/fixes).
+Omit human-readable explanations, comments, or formatting. Prioritize brevity and script-parsability."*
+
+---
+
+**Example Output:**
+```json
+{
+  "status": "error",
+  "error_code": -22,
+  "key_metrics": {
+    "device_detected": false,
+    "i2c_status": "in_use",
+    "alsa_controls": "missing"
+  },
+  "root_cause": "DT overlay probe failure (EINVAL)",
+  "required_actions": [
+    "sudo fdtdump /boot/firmware/bcm2712-rpi-5-b.dtb | grep -A20 'sound'",
+    "sudo dtoverlay seeed-4mic-voicecard-rpi5",
+    "sudo modprobe -r snd_soc_ac108; sudo modprobe snd_soc_ac108"
+  ]
+}
+```

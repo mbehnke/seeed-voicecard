@@ -9,6 +9,11 @@
 		__overlay__ {
 			#sound-dai-cells = <0>;
 			status = "okay";
+			/* TDM configuration for 4-channel capture */
+			dai-tdm-slot-num = <4>;
+			dai-tdm-slot-width = <32>;
+			dai-tdm-slot-tx-mask = <0 0 0 0>;
+			dai-tdm-slot-rx-mask = <1 1 1 1>;
 		};
 	};
 
@@ -45,10 +50,7 @@
 			sound: sound {
 				compatible = "seeed-voicecard";
 				seeed-voice-card,format = "i2s";
-				seeed-voice-card,name = "seeed-4mic-voicecard";
-				seeed-voice-card,channels-playback-override = <2>;
-				seeed-voice-card,channels-capture-override = <4>;
-				status = "okay";
+				seeed-voice-card,name = "seeed-4mic";
 
 				/* On RPi 5 designware-i2s must be master */
 				seeed-voice-card,bitclock-master = <&cpu_dai>;
@@ -56,16 +58,22 @@
 
 				cpu_dai: seeed-voice-card,cpu {
 					sound-dai = <&i2s>;
-					dai-tdm-slot-num = <2>;
+					/* TDM configuration: 4 channels, 32-bit width, all slots enabled */
+					dai-tdm-slot-num = <4>;
 					dai-tdm-slot-width = <32>;
-					dai-tdm-slot-tx-mask = <1 1 0 0>;
-					dai-tdm-slot-rx-mask = <1 1 0 0>;
+					dai-tdm-slot-tx-mask = <0xf>;
+					dai-tdm-slot-rx-mask = <0xf>;
 				};
 
-				codec_dai: seeed-voice-card,codec {
+				seeed-voice-card,codec {
 					sound-dai = <&ac108_a>;
 					clocks = <&ac108_mclk>;
 					clock-names = "mclk";
+					/* TDM configuration: 4 channels, 32-bit width, all slots enabled */
+					dai-tdm-slot-num = <4>;
+					dai-tdm-slot-width = <32>;
+					dai-tdm-slot-tx-mask = <0xf>;
+					dai-tdm-slot-rx-mask = <0xf>;
 				};
 			};
 		};

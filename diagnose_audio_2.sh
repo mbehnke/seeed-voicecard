@@ -20,6 +20,23 @@ step_timer() {
   echo "$duration"
 }
 
+# 0. Kernel-Module und Device Tree prüfen
+module_duration=$(step_timer "Kernel-Module und Device Tree prüfen" "
+  {
+    echo '[Kernel Modules - $(date +'%Y-%m-%d %H:%M:%S')]'
+    lsmod | grep -E '(snd_soc_ac108|snd_soc_seeed_voicecard|snd_soc)' || echo '⚠️ Keine AC108/Seeed-Module geladen'
+    echo ''
+    echo '[Module Info]'
+    modinfo snd_soc_ac108 2>/dev/null || echo '⚠️ snd_soc_ac108 module info nicht verfügbar'
+    echo ''
+    echo '[Device Tree]'
+    sudo dtoverlay -l 2>/dev/null || echo '⚠️ Device Tree Overlay list nicht verfügbar'
+    echo ''
+    echo '[dmesg - seeed/ac108/i2s]'
+    dmesg | grep -Ei 'seeed|ac108|i2s' | tail -100 || echo '⚠️ Keine relevanten dmesg-Einträge'
+  } > '$LOG_DIR/0_kernel_modules.log'
+")
+
 # 1. DAI-Formate prüfen
 dai_duration=$(step_timer "DAI-Formate prüfen" "
   {
@@ -79,12 +96,31 @@ mixer_duration=$(step_timer "Mixer-Controls prüfen" "
 i2c_duration=$(step_timer "I2C-Register-Dump" "
   {
     echo '[I2C Register Dump - $(date +'%Y-%m-%d %H:%M:%S')]'
+    echo '--- I2C Detection ---'
+    i2cdetect -y 1 2>/dev/null || echo '⚠️ i2cdetect fehlgeschlagen'
+    echo ''
+    echo '--- I2C Register Dump (AC108 @ 0x3b) ---'
     if sudo i2cdump -y 1 0x3b 2>&1; then
       echo 'I2C_DUMP_STATUS=ok'
     else
       echo 'I2C_DUMP_STATUS=busy_or_failed'
     fi
   } > '$LOG_DIR/6_i2c_dump.log'
+")
+
+# 6a. I2S und Clock-Konfiguration
+i2s_clock_duration=$(step_timer "I2S und Clock-Konfiguration prüfen" "
+  {
+    echo '[I2S und Clock Config - $(date +'%Y-%m-%d %H:%M:%S')]'
+    echo '--- Clock Tree ---'
+    cat /sys/kernel/debug/clk/clk_summary 2>/dev/null | grep -i i2s || echo '⚠️ Keine I2S-Clocks gefunden'
+    echo ''
+    echo '--- I2S Status ---'
+    sudo find /sys/kernel/debug/asoc/ -name 'state' 2>/dev/null | while read -r f; do
+      echo '---' \$f '---'
+      sudo cat \$f 2>/dev/null || echo '⚠️ Fehler beim Lesen'
+    done
+  } > '$LOG_DIR/6a_i2s_clock.log'
 ")
 
 # 7. ALSA-Status und Testaufnahme (mit Abbruch nach 3s)
@@ -179,11 +215,14 @@ echo "=========================================="
 echo "📁 Logs gespeichert in: $LOG_DIR/"
 echo "⏱️ Gesamtzeit: $TOTAL_DURATION Sekunden"
 echo "📋 Schrittzeiten:"
+echo "   - Kernel-Module/DT: $module_duration s"
 echo "   - DAI-Formate: $dai_duration s"
 echo "   - DAPM-Widgets: $dapm_duration s"
 echo "   - TDM-Logs: $tdm_duration s"
 echo "   - hwparams-Test: $hwparams_duration s"
 echo "   - Mixer-Controls: $mixer_duration s"
+echo "   - I2C-Dump: $i2c_duration s"
+echo "   - I2S/Clock: $i2s_clock_duration s"
 echo "   - ALSA-Status/Aufnahme: $alsa_duration s"
 echo "📄 Maschinenlesbarer Status: $STATUS_FILE"
 echo "=========================================="

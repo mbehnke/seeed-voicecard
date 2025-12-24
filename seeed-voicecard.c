@@ -103,6 +103,9 @@ static int seeed_voice_card_startup(struct snd_pcm_substream *substream)
 		seeed_priv_to_props(priv, rtd->num);
 	int ret;
 
+	pr_info("seeed-voicecard: %s: stream=%s\n", __func__,
+		snd_pcm_stream_str(substream));
+
 	ret = clk_prepare_enable(dai_props->cpu_dai.clk);
 	if (ret)
 		return ret;
@@ -117,6 +120,11 @@ static int seeed_voice_card_startup(struct snd_pcm_substream *substream)
 	if (snd_soc_rtd_to_cpu(rtd, 0)->driver->capture.channels_min) {
 		priv->channels_capture_default = snd_soc_rtd_to_cpu(rtd, 0)->driver->capture.channels_min;
 	}
+	
+	pr_info("seeed-voicecard: %s: Channel override - playback: %d->%d, capture: %d->%d\n",
+		__func__, priv->channels_playback_default, priv->channels_playback_override,
+		priv->channels_capture_default, priv->channels_capture_override);
+	
 	snd_soc_rtd_to_cpu(rtd, 0)->driver->playback.channels_min = priv->channels_playback_override;
 	snd_soc_rtd_to_cpu(rtd, 0)->driver->playback.channels_max = priv->channels_playback_override;
 	snd_soc_rtd_to_cpu(rtd, 0)->driver->capture.channels_min = priv->channels_capture_override;
@@ -154,6 +162,54 @@ static int seeed_voice_card_hw_params(struct snd_pcm_substream *substream,
 	unsigned int mclk, mclk_fs = 0;
 	int ret = 0;
 
+	dev_info(rtd->dev, "=== hw_params ENTER: rate=%u channels=%u ===\n",
+		params_rate(params), params_channels(params));
+
+	/* Configure TDM slots if specified */
+	if (dai_props->cpu_dai.slots) {
+		pr_info("seeed-voicecard: %s: Configuring CPU DAI TDM slots\n", __func__);
+		dev_info(rtd->dev, "Setting CPU DAI TDM: slots=%d, width=%d, tx_mask=0x%x, rx_mask=0x%x\n",
+			dai_props->cpu_dai.slots,
+			dai_props->cpu_dai.slot_width,
+			dai_props->cpu_dai.tx_slot_mask,
+			dai_props->cpu_dai.rx_slot_mask);
+		ret = snd_soc_dai_set_tdm_slot(cpu_dai,
+						dai_props->cpu_dai.tx_slot_mask,
+						dai_props->cpu_dai.rx_slot_mask,
+						dai_props->cpu_dai.slots,
+						dai_props->cpu_dai.slot_width);
+		if (ret < 0) {
+			dev_err(rtd->dev, "CPU DAI TDM slot configuration FAILED: %d\n", ret);
+			dev_warn(rtd->dev, "TDM may not be supported - continuing without explicit TDM config\n");
+			/* Continue anyway - TDM might be handled by simple-card or device tree */
+			ret = 0;
+		} else {
+			dev_info(rtd->dev, "CPU DAI TDM slot configured successfully: ret=%d\n", ret);
+		}
+	}
+
+	if (dai_props->codec_dai.slots) {
+		pr_info("seeed-voicecard: %s: Configuring Codec DAI TDM slots\n", __func__);
+		dev_info(rtd->dev, "Setting Codec DAI TDM: slots=%d, width=%d, tx_mask=0x%x, rx_mask=0x%x\n",
+			dai_props->codec_dai.slots,
+			dai_props->codec_dai.slot_width,
+			dai_props->codec_dai.tx_slot_mask,
+			dai_props->codec_dai.rx_slot_mask);
+		ret = snd_soc_dai_set_tdm_slot(codec_dai,
+						dai_props->codec_dai.tx_slot_mask,
+						dai_props->codec_dai.rx_slot_mask,
+						dai_props->codec_dai.slots,
+						dai_props->codec_dai.slot_width);
+		if (ret < 0) {
+			dev_err(rtd->dev, "Codec DAI TDM slot configuration FAILED: %d\n", ret);
+			dev_warn(rtd->dev, "TDM may not be supported - continuing without explicit TDM config\n");
+			/* Continue anyway - TDM might be handled by simple-card or device tree */
+			ret = 0;
+		} else {
+			dev_info(rtd->dev, "Codec DAI TDM slot configured successfully: ret=%d\n", ret);
+		}
+	}
+
 	if (priv->mclk_fs)
 		mclk_fs = priv->mclk_fs;
 	else if (dai_props->mclk_fs)
@@ -161,18 +217,32 @@ static int seeed_voice_card_hw_params(struct snd_pcm_substream *substream,
 
 	if (mclk_fs) {
 		mclk = params_rate(params) * mclk_fs;
+		pr_info("seeed-voicecard: %s: Configuring MCLK: rate=%d Hz, mclk_fs=%d, mclk=%d Hz\n",
+			__func__, params_rate(params), mclk_fs, mclk);
+		
 		ret = snd_soc_dai_set_sysclk(codec_dai, 0, mclk,
 					     SND_SOC_CLOCK_IN);
-		if (ret && ret != -ENOTSUPP)
+		if (ret && ret != -ENOTSUPP) {
+			dev_err(rtd->dev, "Codec DAI sysclk configuration FAILED: %d\n", ret);
 			goto err;
+		} else if (ret == 0) {
+			dev_info(rtd->dev, "Codec DAI sysclk configured: %d Hz (CLOCK_IN)\n", mclk);
+		}
 
 		ret = snd_soc_dai_set_sysclk(cpu_dai, 0, mclk,
 					     SND_SOC_CLOCK_OUT);
-		if (ret && ret != -ENOTSUPP)
+		if (ret && ret != -ENOTSUPP) {
+			dev_err(rtd->dev, "CPU DAI sysclk configuration FAILED: %d\n", ret);
 			goto err;
+		} else if (ret == 0) {
+			dev_info(rtd->dev, "CPU DAI sysclk configured: %d Hz (CLOCK_OUT)\n", mclk);
+		}
 	}
+	
+	dev_info(rtd->dev, "=== hw_params EXIT: SUCCESS ===\n");
 	return 0;
 err:
+	dev_err(rtd->dev, "=== hw_params EXIT: FAILED ret=%d ===\n", ret);
 	return ret;
 }
 
@@ -918,7 +988,19 @@ static struct platform_driver seeed_voice_card = {
 	.remove = seeed_voice_card_remove,
 };
 
-module_platform_driver(seeed_voice_card);
+static int __init seeed_voice_card_init(void)
+{
+	pr_info("seeed-voicecard: Initializing SEEED Voice Card driver\n");
+	return platform_driver_register(&seeed_voice_card);
+}
+module_init(seeed_voice_card_init);
+
+static void __exit seeed_voice_card_exit(void)
+{
+	pr_info("seeed-voicecard: Unloading SEEED Voice Card driver\n");
+	platform_driver_unregister(&seeed_voice_card);
+}
+module_exit(seeed_voice_card_exit);
 
 MODULE_ALIAS("platform:seeed-voice-card");
 MODULE_LICENSE("GPL v2");
