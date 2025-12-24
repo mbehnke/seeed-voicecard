@@ -144,7 +144,10 @@ END_TIME=$(date +%s)
 TOTAL_DURATION=$((END_TIME - START_TIME))
 
 # Metriken erfassen
-device_detected=$(arecord -l 2>/dev/null | grep -c 'seeed4micvoicec' || true)
+arecord_list=$(arecord -l 2>/dev/null || true)
+
+# Device detection: accept the common Pi5 names seen in arecord -l
+device_detected=$(printf '%s\n' "$arecord_list" | grep -Eci '(seeed4mic|seeed-4mic|ac10x-codec|ac108)' || true)
 controls_found=$(amixer -c 0 scontrols 2>/dev/null | grep -c 'ADC[1-4]' || true)
 [ -z "$device_detected" ] && device_detected=0
 [ -z "$controls_found" ] && controls_found=0
@@ -152,6 +155,18 @@ i2c_status=$(grep -m1 'I2C_DUMP_STATUS' "$LOG_DIR/6_i2c_dump.log" 2>/dev/null | 
 [ -z "$i2c_status" ] && i2c_status="unknown"
 recording_max=$(sox "$LOG_DIR/test_recording.wav" -n stat 2>&1 | awk '/Max level/ {print $3}' | head -1)
 [ -z "$recording_max" ] && recording_max="0.000000"
+
+# Runtime DT binding detection
+dt_sound_compatible=""
+dt_binding="unknown"
+if [ -r /proc/device-tree/sound/compatible ]; then
+  dt_sound_compatible=$(tr '\0' '\n' < /proc/device-tree/sound/compatible 2>/dev/null | sed '/^$/d' | paste -sd ',' -)
+  if printf '%s' "$dt_sound_compatible" | grep -q 'simple-audio-card'; then
+    dt_binding="simple-audio-card"
+  elif printf '%s' "$dt_sound_compatible" | grep -q 'seeed-voicecard'; then
+    dt_binding="seeed-voicecard"
+  fi
+fi
 
 # Root-Cause und Aktionen ableiten
 status="success"
@@ -174,6 +189,11 @@ elif awk 'BEGIN {exit !("'$recording_max'"+0==0)}'; then
   error_code=-3
   root_cause="capture silent (max level 0)"
   required_actions+=("amixer -c 0 sset \"ADC1 PGA gain\" 31" "timeout 3 arecord -D hw:0,0 -f S32_LE -r 16000 -c 4 /tmp/test.wav" "dmesg | grep -i ac108")
+fi
+
+# If DTB was merged but runtime DT is still old, a reboot is required.
+if [ "$dt_binding" != "simple-audio-card" ]; then
+  required_actions+=("tr -d '\\0' < /proc/device-tree/sound/compatible; echo" "sudo reboot")
 fi
 
 # required_actions als JSON-Array
@@ -199,6 +219,8 @@ cat > "$STATUS_FILE" <<EOF
   "error_code": $error_code,
   "key_metrics": {
     "device_detected": $( [ "$device_detected" -gt 0 ] && echo true || echo false ),
+    "dt_binding": "$dt_binding",
+    "dt_sound_compatible": "$dt_sound_compatible",
     "i2c_status": "$i2c_status",
     "alsa_controls": $controls_found,
     "recording_max_level": "$recording_max"

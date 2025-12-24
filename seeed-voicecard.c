@@ -23,6 +23,7 @@
 #include <linux/of_gpio.h>
 #include <linux/platform_device.h>
 #include <linux/string.h>
+#include <sound/pcm.h>
 #include <sound/soc.h>
 #include <sound/soc-dai.h>
 #include <sound/simple_card_utils.h>
@@ -114,21 +115,34 @@ static int seeed_voice_card_startup(struct snd_pcm_substream *substream)
 	if (ret)
 		clk_disable_unprepare(dai_props->cpu_dai.clk);
 
-	if (snd_soc_rtd_to_cpu(rtd, 0)->driver->playback.channels_min) {
-		priv->channels_playback_default = snd_soc_rtd_to_cpu(rtd, 0)->driver->playback.channels_min;
+	/*
+	 * Apply channel overrides as per-stream PCM constraints.
+	 *
+	 * Do NOT mutate ->driver->capture/playback channels_{min,max} here:
+	 * those structures are shared globally and will break other streams/cards.
+	 */
+	if (substream->runtime) {
+		unsigned int ch = 0;
+
+		if (substream->stream == SNDRV_PCM_STREAM_CAPTURE)
+			ch = priv->channels_capture_override;
+		else
+			ch = priv->channels_playback_override;
+
+		if (ch) {
+			ret = snd_pcm_hw_constraint_minmax(substream->runtime,
+							SNDRV_PCM_HW_PARAM_CHANNELS,
+							ch, ch);
+			if (ret < 0)
+				dev_warn(rtd->dev,
+					"Failed to apply channel constraint (%u): %d\n",
+					ch, ret);
+			else
+				dev_info(rtd->dev,
+					"Applied channel constraint: %u (stream=%s)\n",
+					ch, snd_pcm_stream_str(substream));
+		}
 	}
-	if (snd_soc_rtd_to_cpu(rtd, 0)->driver->capture.channels_min) {
-		priv->channels_capture_default = snd_soc_rtd_to_cpu(rtd, 0)->driver->capture.channels_min;
-	}
-	
-	pr_info("seeed-voicecard: %s: Channel override - playback: %d->%d, capture: %d->%d\n",
-		__func__, priv->channels_playback_default, priv->channels_playback_override,
-		priv->channels_capture_default, priv->channels_capture_override);
-	
-	snd_soc_rtd_to_cpu(rtd, 0)->driver->playback.channels_min = priv->channels_playback_override;
-	snd_soc_rtd_to_cpu(rtd, 0)->driver->playback.channels_max = priv->channels_playback_override;
-	snd_soc_rtd_to_cpu(rtd, 0)->driver->capture.channels_min = priv->channels_capture_override;
-	snd_soc_rtd_to_cpu(rtd, 0)->driver->capture.channels_max = priv->channels_capture_override;
 
 	return ret;
 }
@@ -139,11 +153,6 @@ static void seeed_voice_card_shutdown(struct snd_pcm_substream *substream)
 	struct seeed_card_data *priv =	snd_soc_card_get_drvdata(rtd->card);
 	struct seeed_dai_props *dai_props =
 		seeed_priv_to_props(priv, rtd->num);
-
-	snd_soc_rtd_to_cpu(rtd, 0)->driver->playback.channels_min = priv->channels_playback_default;
-	snd_soc_rtd_to_cpu(rtd, 0)->driver->playback.channels_max = priv->channels_playback_default;
-	snd_soc_rtd_to_cpu(rtd, 0)->driver->capture.channels_min = priv->channels_capture_default;
-	snd_soc_rtd_to_cpu(rtd, 0)->driver->capture.channels_max = priv->channels_capture_default;
 
 	clk_disable_unprepare(dai_props->cpu_dai.clk);
 
@@ -165,9 +174,9 @@ static int seeed_voice_card_hw_params(struct snd_pcm_substream *substream,
 	dev_info(rtd->dev, "=== hw_params ENTER: rate=%u channels=%u ===\n",
 		params_rate(params), params_channels(params));
 
-	/* Configure TDM slots if specified */
+	/* Configure TDM slots if specified in device tree */
 	if (dai_props->cpu_dai.slots) {
-		pr_info("seeed-voicecard: %s: Configuring CPU DAI TDM slots\n", __func__);
+		pr_info("seeed-voicecard: %s: Configuring CPU DAI TDM slots from DT\n", __func__);
 		dev_info(rtd->dev, "Setting CPU DAI TDM: slots=%d, width=%d, tx_mask=0x%x, rx_mask=0x%x\n",
 			dai_props->cpu_dai.slots,
 			dai_props->cpu_dai.slot_width,
@@ -255,7 +264,7 @@ int seeed_voice_card_register_set_clock(int stream, int (*set_clock)(int, struct
 	}
 	return 0;
 }
-EXPORT_SYMBOL(seeed_voice_card_register_set_clock);
+EXPORT_SYMBOL_GPL(seeed_voice_card_register_set_clock);
 
 /*
  * work_cb_codec_clk: clear audio codec inner clock.

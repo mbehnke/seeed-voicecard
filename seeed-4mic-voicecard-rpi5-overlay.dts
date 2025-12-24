@@ -7,13 +7,7 @@
 	fragment@0 {
 		target = <&i2s>;
 		__overlay__ {
-			#sound-dai-cells = <0>;
 			status = "okay";
-			/* TDM configuration for 4-channel capture */
-			dai-tdm-slot-num = <4>;
-			dai-tdm-slot-width = <32>;
-			dai-tdm-slot-tx-mask = <0 0 0 0>;
-			dai-tdm-slot-rx-mask = <1 1 1 1>;
 		};
 	};
 
@@ -48,32 +42,41 @@
 		target-path = "/";
 		__overlay__ {
 			sound: sound {
-				compatible = "seeed-voicecard";
-				seeed-voice-card,format = "i2s";
-				seeed-voice-card,name = "seeed-4mic";
+				/*
+				 * Clean up legacy properties/nodes from older seeed-voicecard
+				 * overlays which may have been merged previously.
+				 */
+				compatible = "simple-audio-card";
+				simple-audio-card,format = "i2s";
+				simple-audio-card,name = "seeed-4mic";
+				simple-audio-card,bitclock-master = <&cpu_dai>;
+				simple-audio-card,frame-master = <&cpu_dai>;
 
-				/* On RPi 5 designware-i2s must be master */
-				seeed-voice-card,bitclock-master = <&cpu_dai>;
-				seeed-voice-card,frame-master = <&cpu_dai>;
+				/delete-property/ seeed-voice-card,name;
+				/delete-property/ seeed-voice-card,format;
+				/delete-property/ seeed-voice-card,bitclock-master;
+				/delete-property/ seeed-voice-card,frame-master;
+				/delete-property/ seeed-voice-card,channels-capture-override;
+				/delete-property/ seeed-voice-card,channels-playback-override;
+				/delete-node/ seeed-voice-card,cpu;
+				/delete-node/ seeed-voice-card,codec;
 
-				cpu_dai: seeed-voice-card,cpu {
+				cpu_dai: simple-audio-card,cpu {
 					sound-dai = <&i2s>;
-					/* TDM configuration: 4 channels, 32-bit width, all slots enabled */
+					/* 4-channel TDM over I2S (AC108) */
 					dai-tdm-slot-num = <4>;
 					dai-tdm-slot-width = <32>;
-					dai-tdm-slot-tx-mask = <0xf>;
 					dai-tdm-slot-rx-mask = <0xf>;
 				};
 
-				seeed-voice-card,codec {
+				simple-audio-card,codec {
 					sound-dai = <&ac108_a>;
 					clocks = <&ac108_mclk>;
 					clock-names = "mclk";
-					/* TDM configuration: 4 channels, 32-bit width, all slots enabled */
+					/* 4-channel TDM over I2S (AC108) */
 					dai-tdm-slot-num = <4>;
 					dai-tdm-slot-width = <32>;
 					dai-tdm-slot-tx-mask = <0xf>;
-					dai-tdm-slot-rx-mask = <0xf>;
 				};
 			};
 		};

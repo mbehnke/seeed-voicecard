@@ -161,11 +161,14 @@ function install_module {
 install_module "./" "seeed-voicecard"
 
 
-# install dtbos
-# Detect Pi 5 (BCM2712) vs older models
+IS_PI5=0
 if grep -q "bcm2712" /proc/cpuinfo; then
+  IS_PI5=1
+fi
+
+# install dtbos
+if [ $IS_PI5 -eq 1 ]; then
   echo "Detected Raspberry Pi 5 (BCM2712)"
-  # For Pi 5, compile the rpi5-specific overlays
   ./builddtbo.sh seeed-4mic-voicecard-rpi5
   cp seeed-4mic-voicecard-rpi5.dtbo $OVERLAYS
 else
@@ -181,8 +184,15 @@ fi
 rm -f /usr/lib/arm-linux-gnueabihf/alsa-lib/libasound_module_pcm_ac108.so
 
 #set kernel modules
-grep -q "^snd-soc-seeed-voicecard$" /etc/modules || \
-  echo "snd-soc-seeed-voicecard" >> /etc/modules
+# On Pi 5 we use a DT `simple-audio-card` overlay; autoloading the seeed
+# machine driver can conflict with that and break card registration.
+if [ $IS_PI5 -eq 1 ]; then
+  sed -i '/^snd-soc-seeed-voicecard$/d' /etc/modules || true
+else
+  grep -q "^snd-soc-seeed-voicecard$" /etc/modules || \
+    echo "snd-soc-seeed-voicecard" >> /etc/modules
+fi
+
 grep -q "^snd-soc-ac108$" /etc/modules || \
   echo "snd-soc-ac108" >> /etc/modules
 grep -q "^snd-soc-wm8960$" /etc/modules || \
@@ -202,13 +212,38 @@ grep -q "^dtparam=i2s=on$" $CONFIG || \
   echo "dtparam=i2s=on" >> $CONFIG
 
 # Configure correct overlay for Pi 5 vs Pi 4
-if grep -q "bcm2712" /proc/cpuinfo; then
+if [ $IS_PI5 -eq 1 ]; then
   # Pi 5 specific overlay configuration
   grep -q "^dtoverlay=seeed-4mic-voicecard-rpi5$" $CONFIG || {
     # Remove old overlay if present
     sed -i '/^dtoverlay=seeed-4mic-voicecard[^-]/d' $CONFIG || true
     echo "dtoverlay=seeed-4mic-voicecard-rpi5" >> $CONFIG
   }
+
+
+  # Prefer merging overlay into the base DTB on Pi 5 (avoids runtime overlay issues).
+  # The overlay also contains /delete-* directives to clean legacy properties if present.
+  if command -v fdtoverlay >/dev/null 2>&1; then
+    DTB=/boot/firmware/bcm2712-rpi-5-b.dtb
+    [ -f /boot/bcm2712-rpi-5-b.dtb ] && DTB=/boot/bcm2712-rpi-5-b.dtb
+
+    if [ -f "$DTB" ] && [ -f "$OVERLAYS/seeed-4mic-voicecard-rpi5.dtbo" ]; then
+      ts=$(date +%Y%m%d_%H%M%S)
+      cp -a "$DTB" "$DTB.bak.$ts"
+
+      if fdtoverlay -i "$DTB" -o "$DTB.merged" "$OVERLAYS/seeed-4mic-voicecard-rpi5.dtbo"; then
+        cp -a "$DTB.merged" "$DTB"
+        # Disable the runtime overlay line to prevent double-application.
+        sed -i -e 's/^dtoverlay=seeed-4mic-voicecard-rpi5$/# dtoverlay=seeed-4mic-voicecard-rpi5 (merged into base DTB)/' "$CONFIG" || true
+      else
+        echo "Warning: fdtoverlay merge failed; leaving config.txt dtoverlay enabled"
+      fi
+    else
+      echo "Warning: DTB or dtbo missing; leaving config.txt dtoverlay enabled"
+    fi
+  else
+    echo "Warning: fdtoverlay not found; leaving config.txt dtoverlay enabled"
+  fi
 else
   # Pi 4 and earlier - use standard overlay
   grep -q "^dtoverlay=seeed-4mic-voicecard$" $CONFIG || \
@@ -237,8 +272,17 @@ git --git-dir=/etc/voicecard/.git --work-tree=/etc/voicecard/ commit  -m "origin
 
 cp seeed-voicecard /usr/bin/
 cp seeed-voicecard.service /lib/systemd/system/
-systemctl enable  seeed-voicecard.service
-systemctl start   seeed-voicecard
+
+# Pi 5: don't auto-enable the service by default because it historically
+# attempted runtime overlay application (which can fail/conflict). The script
+# can still be run manually if needed.
+if [ $IS_PI5 -eq 1 ]; then
+  systemctl disable seeed-voicecard.service >/dev/null 2>&1 || true
+  systemctl stop    seeed-voicecard.service >/dev/null 2>&1 || true
+else
+  systemctl enable  seeed-voicecard.service
+  systemctl start   seeed-voicecard
+fi
 
 echo "------------------------------------------------------"
 echo "Please reboot your raspberry pi to apply all settings"
