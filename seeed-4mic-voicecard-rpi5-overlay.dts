@@ -63,20 +63,12 @@
 
 				cpu_dai: simple-audio-card,cpu {
 					sound-dai = <&i2s>;
-					/* 4-channel TDM over I2S (AC108) */
-					dai-tdm-slot-num = <4>;
-					dai-tdm-slot-width = <32>;
-					dai-tdm-slot-rx-mask = <0xf>;
-				};
+			};
 
-				simple-audio-card,codec {
-					sound-dai = <&ac108_a>;
-					clocks = <&ac108_mclk>;
-					clock-names = "mclk";
-					/* 4-channel TDM over I2S (AC108) */
-					dai-tdm-slot-num = <4>;
-					dai-tdm-slot-width = <32>;
-					dai-tdm-slot-tx-mask = <0xf>;
+			simple-audio-card,codec {
+				sound-dai = <&ac108_a>;
+				clocks = <&ac108_mclk>;
+				clock-names = "mclk";
 				};
 			};
 		};
