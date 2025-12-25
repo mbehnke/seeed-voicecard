@@ -129,6 +129,14 @@ alsa_duration=$(step_timer "ALSA-Status und Testaufnahme (3s)" "
     echo '[ALSA Status - $(date +'%Y-%m-%d %H:%M:%S')]'
     arecord -l 2>/dev/null
     amixer -c 0 controls 2>/dev/null
+    echo '--- Gains (set to 31 for test) ---'
+    for ch in 1 2 3 4; do
+      amixer -c 0 sset "ADC${ch} PGA gain" 31 >/dev/null 2>&1 || true
+    done
+    echo '--- Digital volumes (set to 90%) ---'
+    for ch in 1 2 3 4; do
+      amixer -c 0 sset "CH${ch} digital volume" '90%' >/dev/null 2>&1 || true
+    done
     echo '--- Testaufnahme (3s) ---'
     timeout 3 arecord -D hw:0,0 -f S32_LE -r 16000 -c 4 '$LOG_DIR/test_recording.wav' 2>&1
     if [ \${PIPESTATUS[0]} -ne 0 ]; then
@@ -188,7 +196,7 @@ elif awk 'BEGIN {exit !("'$recording_max'"+0==0)}'; then
   status="error"
   error_code=-3
   root_cause="capture silent (max level 0)"
-  required_actions+=("amixer -c 0 sset \"ADC1 PGA gain\" 31" "timeout 3 arecord -D hw:0,0 -f S32_LE -r 16000 -c 4 /tmp/test.wav" "dmesg | grep -i ac108")
+  required_actions+=("amixer -c 0 sset \"ADC1 PGA gain\" 31" "amixer -c 0 sset \"CH1 digital volume\" '90%'" "timeout 3 arecord -D hw:0,0 -f S32_LE -r 16000 -c 4 $LOG_DIR/test.wav" "dmesg | grep -i ac108")
 fi
 
 # If DTB was merged but runtime DT is still old, a reboot is required.

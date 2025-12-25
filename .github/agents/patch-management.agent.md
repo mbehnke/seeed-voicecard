@@ -197,10 +197,8 @@ instructions: |
    
    / {
   +#if RPI_VERSION >= 5
-  +    compatible = "brcm,bcm2712";
-  +#else
-       compatible = "brcm,bcm2835";
-  +#endif
+ 	compatible = "brcm,bcm2708", "brcm,bcm2835", "brcm,bcm2836", "brcm,bcm2837", "brcm,bcm2711", "brcm,bcm2712";
+
   ```
   
   ### 7. Regression Testing

@@ -4,7 +4,9 @@
 
 LOG_DIR="$(cd "$(dirname "$0")" && pwd)/logs"
 mkdir -p "$LOG_DIR"
-LOG_FILE="$LOG_DIR/diagnose_audio_$(date '+%Y%m%d_%H%M%S').log"
+TS="$(date '+%Y%m%d_%H%M%S')"
+LOG_FILE="$LOG_DIR/diagnose_audio_${TS}.log"
+STATUS_FILE="$LOG_DIR/diagnose_audio_${TS}.json"
 run_ts="$(date '+%Y-%m-%d %H:%M:%S')"
 
 log_msg() {
@@ -119,24 +121,36 @@ echo "" | tee -a "$LOG_FILE"
 
 # 7. Test Recording
 log_msg "7️⃣  Performing Test Recording (3 seconds)..."
-log_msg "   🎤 Please speak or make noise now..."
-arecord -D plughw:0,0 -f S32_LE -r 16000 -c 4 -d 3 /tmp/test_ac108.wav 2>&1 | grep -v "^$" | tee -a "$LOG_FILE"
+
+# Auto-detect seeed card number
+CARD_NUM=$(arecord -l 2>/dev/null | grep -i seeed | head -1 | sed -n 's/card \([0-9]\+\):.*/\1/p')
+
+if [ -z "$CARD_NUM" ]; then
+    log_msg "   ❌ No seeed card found, cannot test recording"
+else
+    log_msg "   Using card $CARD_NUM (hw:$CARD_NUM,0)"
+    log_msg "   🎤 Please speak or make noise now..."
+    arecord -D hw:$CARD_NUM,0 -f S32_LE -r 16000 -c 4 -d 3 "$LOG_DIR/test_ac108_${TS}.wav" 2>&1 | grep -v "^$" | tee -a "$LOG_FILE"
+fi
 echo "" | tee -a "$LOG_FILE"
 
 # 8. Analyze Recording
 log_msg "8️⃣  Analyzing Recording..."
-if [ -f /tmp/test_ac108.wav ]; then
-    FILE_SIZE=$(stat -f%z /tmp/test_ac108.wav 2>/dev/null || stat -c%s /tmp/test_ac108.wav)
+if [ -f "$LOG_DIR/test_ac108_${TS}.wav" ]; then
+    FILE_SIZE=$(stat -f%z "$LOG_DIR/test_ac108_${TS}.wav" 2>/dev/null || stat -c%s "$LOG_DIR/test_ac108_${TS}.wav")
     log_msg "   File size: ${FILE_SIZE} bytes"
     
     # Python analysis
+    export WAV_PATH="$LOG_DIR/test_ac108_${TS}.wav"
     python3 << 'EOF' | tee -a "$LOG_FILE"
 import wave
 import struct
 import sys
+import os
 
 try:
-    with wave.open('/tmp/test_ac108.wav', 'rb') as w:
+    path = os.environ.get('WAV_PATH', '/dev/null')
+    with wave.open(path, 'rb') as w:
         frames = w.readframes(5000)
         if w.getsampwidth() == 4:
             samples = struct.unpack('<' + 'i' * (len(frames)//4), frames)
@@ -225,3 +239,71 @@ echo "   • Reboot: sudo reboot" | tee -a "$LOG_FILE"
 echo "   • Check config: cat /boot/firmware/config.txt | grep seeed" | tee -a "$LOG_FILE"
 echo "Log saved to: $LOG_FILE" | tee -a "$LOG_FILE"
 echo "" | tee -a "$LOG_FILE"
+
+# Minimal JSON output for script analysis
+device_detected=false
+if arecord -l 2>/dev/null | grep -qi seeed; then
+    device_detected=true
+fi
+alsa_controls_count=$(amixer -c 0 scontrols 2>/dev/null | grep -c "ADC[1-4]" || true)
+[ -z "$alsa_controls_count" ] && alsa_controls_count=0
+i2c_status="unknown"
+if i2cdetect -y 1 2>/dev/null | grep -q "UU"; then
+    i2c_status="in_use"
+fi
+recording_max="0.000000"
+if [ -f "$LOG_DIR/test_ac108_${TS}.wav" ]; then
+    recording_max=$(sox "$LOG_DIR/test_ac108_${TS}.wav" -n stat 2>&1 | awk '/Max level/ {print $3}' | head -1)
+    [ -z "$recording_max" ] && recording_max="0.000000"
+fi
+
+status="success"
+error_code=0
+root_cause="ok"
+required_actions=()
+
+if [ "$device_detected" != "true" ]; then
+    status="error"
+    error_code=-1
+    root_cause="ALSA card missing"
+    required_actions+=("arecord -l" "dmesg | grep -i asoc")
+elif [ "$alsa_controls_count" -eq 0 ]; then
+    status="error"
+    error_code=-2
+    root_cause="AC108 controls missing"
+    required_actions+=("amixer -c 0 scontrols" "sudo alsactl init")
+elif awk 'BEGIN {exit !("'$recording_max'"+0==0)}'; then
+    status="error"
+    error_code=-3
+    root_cause="capture silent"
+    required_actions+=("amixer -c 0 sset 'ADC1 PGA gain' 31" "timeout 3 arecord -D hw:0,0 -f S32_LE -r 16000 -c 4 \"$LOG_DIR/test.wav\"")
+fi
+
+actions_json="[]"
+if [ ${#required_actions[@]} -gt 0 ]; then
+    actions_json="["
+    for i in "${!required_actions[@]}"; do
+        action=${required_actions[$i]}
+        action_esc=$(printf '%s' "$action" | sed 's/\\/\\\\/g; s/"/\\"/g')
+        if [ "$i" -gt 0 ]; then actions_json+=","; fi
+        actions_json+="\"$action_esc\""
+    done
+    actions_json+="]"
+fi
+
+cat > "$STATUS_FILE" <<EOF
+{
+    "status": "$status",
+    "error_code": $error_code,
+    "key_metrics": {
+        "device_detected": $device_detected,
+        "i2c_status": "$i2c_status",
+        "alsa_controls": $alsa_controls_count,
+        "recording_max_level": "$recording_max"
+    },
+    "root_cause": "$root_cause",
+    "required_actions": $actions_json
+}
+EOF
+
+echo "Status JSON: $STATUS_FILE" | tee -a "$LOG_FILE"

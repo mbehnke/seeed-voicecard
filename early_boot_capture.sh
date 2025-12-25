@@ -90,6 +90,14 @@ recording_max="n/a"
 
   echo
   echo "=== Testaufnahme 1s (S32_LE, 16k, 4ch) ==="
+  echo "--- Gains (set to 31 for test) ---"
+  for ch in 1 2 3 4; do
+    amixer -c 0 sset "ADC${ch} PGA gain" 31 >/dev/null 2>&1 || true
+  done
+  echo "--- Digital volumes (set to 90%) ---"
+  for ch in 1 2 3 4; do
+    amixer -c 0 sset "CH${ch} digital volume" 90% >/dev/null 2>&1 || true
+  done
   echo "--- Hardware parameters check ---"
   timeout 2 arecord -D hw:0,0 --dump-hw-params -f S32_LE -r 16000 -c 4 /dev/null 2>&1 || echo "hwparams dump failed"
   echo
@@ -134,7 +142,7 @@ elif awk 'BEGIN {exit !("'$recording_max'"+0==0)}'; then
   status="error"
   error_code=-3
   root_cause="capture silent"
-  required_actions+=("amixer -c 0 sset \"ADC1 PGA gain\" 31" "timeout 3 arecord -D hw:0,0 -f S32_LE -r 16000 -c 4 /tmp/test.wav")
+  required_actions+=("amixer -c 0 sset \"ADC1 PGA gain\" 31" "amixer -c 0 sset \"CH1 digital volume\" '90%'" "timeout 3 arecord -D hw:0,0 -f S32_LE -r 16000 -c 4 \"$LOG_DIR/early_boot_test.wav\"")
 fi
 
 actions_json="[]"

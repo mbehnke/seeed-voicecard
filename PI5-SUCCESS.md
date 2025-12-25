@@ -180,3 +180,48 @@ fragment@3 {
 ---
 
 **Zusammengefasst**: ReSpeaker 4-Mic Array funktioniert jetzt **vollständig und zuverlässig** auf Raspberry Pi 5 mit Kernel 6.12.x! 🎉
+
+
+Read [](file:///home/adm_behnke/seeed-voicecard/seeed-4mic-voicecard-rpi5-overlay.dts)
+
+Ran terminal command: while sudo dtoverlay -R 0 2>/dev/null; do :; done; dtoverlay -l
+
+Ran terminal command: sudo dtoverlay -v seeed-4mic-voicecard-rpi5 2>&1 | tee /tmp/dtoverlay.log
+
+Ran terminal command: sudo dmesg | tail -60
+
+Ran terminal command: dtc -I dtb -O dts /boot/firmware/overlays/seeed-4mic-voicecard-rpi5.dtbo | head -80
+
+Using "Apply Patch"
+
+
+```
+
+```
+
+
+Ran terminal command: dtc -I dts -O dtb -o /tmp/seeed-4mic-voicecard-rpi5.dtbo seeed-4mic-voicecard-rpi5-overlay.dts 2>&1
+
+I pulled fresh logs and the overlay still won’t apply in-kernel (configfs). Offline `fdtoverlay` succeeds, so the DTBO itself is valid; the runtime reject is likely due to the symbol/fixup resolution for the RP1 nodes.
+
+I attempted a path-based overlay, but dtc refused `&{/axi/pcie@1000120000/rp1/i2s@a0000}` fixups. The simplest next step is to stick with the symbol-based overlay and try an explicit path target while keeping a resolvable phandle for the CPU DAI:
+
+**Plan to try (requires a quick edit and reapply):**
+- Use target-path for the fragments, and refer to the CPU DAI via a local label bound to the fragment’s target. That avoids relying on the exported `&i2s` symbol at runtime.
+
+Overlay change I can apply:
+- `fragment@0` → `target-path = "/axi/pcie@1000120000/rp1/i2s@a0000";` and add a local label to the target (`i2s_rp1: __overlay__ { status = "okay"; };`).
+- `simple-audio-card,cpu` → `sound-dai = <&i2s_rp1>;`
+- `fragment@2` → `target-path = "/axi/pcie@1000120000/rp1/i2c@74000";`
+- Keep `simple-audio-card` with `format = "i2s"` (RP1 dw-i2s appears to reject DSP_A).
+- Leave codec node and mclk as-is.
+
+After that:
+1) Recompile + copy DTBO.
+2) Clear overlays: `while sudo dtoverlay -R 0 2>/dev/null; do :; done`
+3) Apply: `sudo dtoverlay -v seeed-4mic-voicecard-rpi5`
+4) Rerun `sudo bash ./diagnose_audio.sh` and check diagnose_audio.log.
+
+If you want, I’ll apply that overlay tweak now and run the sequence.
+
+Made changes.
