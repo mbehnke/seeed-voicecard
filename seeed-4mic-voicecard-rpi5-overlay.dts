@@ -49,12 +49,12 @@
 				status = "okay";
 
 				seeed-voice-card,dai-link {
-					seeed-voice-card,format = "i2s";
-					// RPi5 designware-i2s requires CPU as master
-					seeed-voice-card,bitclock-master = <&i2s>;
-					seeed-voice-card,frame-master = <&i2s>;
+					format = "i2s";
+					// RPi5 designware-i2s as I2S master
+					bitclock-master = <&sound_cpu>;
+					frame-master = <&sound_cpu>;
 
-					seeed-voice-card,cpu {
+					sound_cpu: seeed-voice-card,cpu {
 						sound-dai = <&i2s>;
 					};
 

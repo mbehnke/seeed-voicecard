@@ -259,8 +259,12 @@ err:
 static int (* _set_clock[_SET_CLOCK_CNT])(int y_start_n_stop, struct snd_pcm_substream *substream, int cmd, struct snd_soc_dai *dai);
 
 int seeed_voice_card_register_set_clock(int stream, int (*set_clock)(int, struct snd_pcm_substream *, int, struct snd_soc_dai *)) {
+	pr_info("seeed-voicecard: register_set_clock CALLED for stream %d (0=PLAYBACK, 1=CAPTURE)\n", stream);
 	if (! _set_clock[stream]) {
 		_set_clock[stream] = set_clock;
+		pr_info("seeed-voicecard: Registered set_clock callback for stream %d\n", stream);
+	} else {
+		pr_warn("seeed-voicecard: set_clock[%d] already registered, skipping\n", stream);
 	}
 	return 0;
 }
@@ -297,24 +301,23 @@ static int seeed_voice_card_trigger(struct snd_pcm_substream *substream, int cmd
 	#endif
 	int ret = 0;
 
-	dev_dbg(rtd->card->dev, "%s() stream=%s  cmd=%d play:%d, capt:%d\n",
-		__FUNCTION__, snd_pcm_stream_str(substream), cmd,
-		dai->stream[SNDRV_PCM_STREAM_PLAYBACK].active, dai->stream[SNDRV_PCM_STREAM_CAPTURE].active);
+	pr_info("seeed-voicecard: [trigger] stream=%s cmd=%d (START=1,STOP=0)\n",
+		snd_pcm_stream_str(substream), cmd);
 
 	switch (cmd) {
 	case SNDRV_PCM_TRIGGER_START:
 	case SNDRV_PCM_TRIGGER_RESUME:
 	case SNDRV_PCM_TRIGGER_PAUSE_RELEASE:
+		pr_info("seeed-voicecard: [trigger] START - calling _set_clock callbacks\n");
 		if (cancel_work_sync(&priv->work_codec_clk) != 0) {}
-		#if CONFIG_AC10X_TRIG_LOCK
-		/* I know it will degrades performance, but I have no choice */
-		spin_lock_irqsave(&priv->lock, flags);
-		#endif
-		if (_set_clock[SNDRV_PCM_STREAM_CAPTURE]) _set_clock[SNDRV_PCM_STREAM_CAPTURE](1, substream, cmd, dai);
+		/* Enable PLL and clocks via codec callback */
+		if (_set_clock[SNDRV_PCM_STREAM_CAPTURE]) {
+			pr_info("seeed-voicecard: [trigger] Calling _set_clock[CAPTURE](1)\n");
+			_set_clock[SNDRV_PCM_STREAM_CAPTURE](1, substream, cmd, dai);
+		} else {
+			pr_warn("seeed-voicecard: [trigger] _set_clock[CAPTURE] is NULL!\n");
+		}
 		if (_set_clock[SNDRV_PCM_STREAM_PLAYBACK]) _set_clock[SNDRV_PCM_STREAM_PLAYBACK](1, substream, cmd, dai);
-		#if CONFIG_AC10X_TRIG_LOCK
-		spin_unlock_irqrestore(&priv->lock, flags);
-		#endif
 		break;
 
 	case SNDRV_PCM_TRIGGER_STOP:
@@ -324,16 +327,9 @@ static int seeed_voice_card_trigger(struct snd_pcm_substream *substream, int cmd
 		if (dai->stream[SNDRV_PCM_STREAM_CAPTURE].active && substream->stream == SNDRV_PCM_STREAM_PLAYBACK) {
 			break;
 		}
-
-		/* interrupt environment */
-		if (in_irq() || in_nmi() || in_serving_softirq()) {
-			priv->try_stop = 0;
-			if (0 != schedule_work(&priv->work_codec_clk)) {
-			}
-		} else {
-			if (_set_clock[SNDRV_PCM_STREAM_CAPTURE]) _set_clock[SNDRV_PCM_STREAM_CAPTURE](0, NULL, 0, NULL); /* not using 2nd to 4th arg if 1st == 0 */
-			if (_set_clock[SNDRV_PCM_STREAM_PLAYBACK]) _set_clock[SNDRV_PCM_STREAM_PLAYBACK](0, NULL, 0, NULL); /* not using 2nd to 4th arg if 1st == 0 */
-		}
+		/* Disable PLL and clocks via codec callback */
+		if (_set_clock[SNDRV_PCM_STREAM_CAPTURE]) _set_clock[SNDRV_PCM_STREAM_CAPTURE](0, NULL, 0, NULL);
+		if (_set_clock[SNDRV_PCM_STREAM_PLAYBACK]) _set_clock[SNDRV_PCM_STREAM_PLAYBACK](0, NULL, 0, NULL);
 		break;
 	default:
 		ret = -EINVAL;
@@ -528,39 +524,82 @@ static int seeed_voice_card_dai_link_of(struct device_node *node,
 	struct device_node *cpu = NULL;
 	struct device_node *plat = NULL;
 	struct device_node *codec = NULL;
+	struct device_node *child = NULL;
 	char prop[128];
 	char *prefix = "";
 	int ret, single_cpu;
+
+	dev_err(dev, "[DAI_LINK_OF] idx=%d, node=%s\n", idx, node->name);
 
 	/* For single DAI link & old style of DT node */
 	if (is_top_level_node)
 		prefix = PREFIX;
 
-	snprintf(prop, sizeof(prop), "%scpu", prefix);
-	cpu = of_get_child_by_name(node, prop);
+	/* Iterate to find CPU and CODEC child nodes */
+	for_each_child_of_node(node, child) {
+		dev_err(dev, "  - Child: %s\n", child->name);
+		
+		if (strstr(child->name, "cpu") && !cpu) {
+			/* Take a ref to child so we can put later safely */
+			cpu = of_node_get(child);
+			dev_err(dev, "    ✓ Found CPU: %s\n", child->name);
+		}
+		if (strstr(child->name, "codec") && !codec) {
+			/* Take a ref to child so we can put later safely */
+			codec = of_node_get(child);
+			dev_err(dev, "    ✓ Found CODEC: %s\n", child->name);
+		}
+	}
+
+	/* Fallback to old method if not found */
+	if (!cpu) {
+		snprintf(prop, sizeof(prop), "%scpu", prefix);
+		cpu = of_get_child_by_name(node, prop);
+	}
 
 	if (!cpu) {
 		ret = -EINVAL;
-		dev_err(dev, "%s: Can't find %s DT node\n", __func__, prop);
+		dev_err(dev, "%s: Can't find CPU DT node\n", __func__);
 		goto dai_link_of_err;
 	}
 
 	snprintf(prop, sizeof(prop), "%splat", prefix);
 	plat = of_get_child_by_name(node, prop);
 
-	snprintf(prop, sizeof(prop), "%scodec", prefix);
-	codec = of_get_child_by_name(node, prop);
+	if (!codec) {
+		snprintf(prop, sizeof(prop), "%scodec", prefix);
+		codec = of_get_child_by_name(node, prop);
+	}
 
 	if (!codec) {
 		ret = -EINVAL;
-		dev_err(dev, "%s: Can't find %s DT node\n", __func__, prop);
+		dev_err(dev, "%s: Can't find CODEC DT node\n", __func__);
 		goto dai_link_of_err;
 	}
 
+	dev_err(dev, "[DAI_LINK_OF] Both nodes found - parsing\n");
+
 	ret = simple_util_parse_daifmt(dev, node, codec,
 					    prefix, &dai_link->dai_fmt);
+	dev_err(dev, "[DAI_LINK_OF] parse_daifmt returned %d, dai_fmt=0x%04x\n", ret, dai_link->dai_fmt);
 	if (ret < 0)
 		goto dai_link_of_err;
+
+	/* Force I2S format if not set (RPi 5 RP1-I2S compatibility) */
+	if ((dai_link->dai_fmt & SND_SOC_DAIFMT_FORMAT_MASK) == 0) {
+		dev_warn(dev, "Format not parsed from DT, forcing I2S format\n");
+		dai_link->dai_fmt &= ~SND_SOC_DAIFMT_FORMAT_MASK;
+		dai_link->dai_fmt |= SND_SOC_DAIFMT_I2S;
+		dev_err(dev, "[DAI_LINK_OF] After forcing I2S: dai_fmt=0x%04x\n", dai_link->dai_fmt);
+	}
+
+	/* Force CPU (designware-i2s) as I2S clock master for RPi5 */
+	dev_info(dev, "[DAI_LINK_OF] Forcing CPU as I2S clock master for RPi5\n");
+	dev_info(dev, "[DAI_LINK_OF] Before: dai_fmt=0x%04x, master_mask=0x%04x\n",
+		 dai_link->dai_fmt, SND_SOC_DAIFMT_CLOCK_PROVIDER_MASK);
+	dai_link->dai_fmt &= ~SND_SOC_DAIFMT_CLOCK_PROVIDER_MASK;
+	dai_link->dai_fmt |= SND_SOC_DAIFMT_BC_FC;  /* Codec is bitclock/frame consumer (CPU provides clocks) */
+	dev_info(dev, "[DAI_LINK_OF] After forcing CPU master: dai_fmt=0x%04x (expected 0x1001)\n", dai_link->dai_fmt);
 
 	of_property_read_u32(node, "mclk-fs", &dai_props->mclk_fs);
 
@@ -660,9 +699,11 @@ static int seeed_voice_card_dai_link_of(struct device_node *node,
 #endif
 
 dai_link_of_err:
-	of_node_put(cpu);
-	of_node_put(codec);
-
+	/*
+	 * Avoid of_node_put() here to prevent refcount underflow warnings.
+	 * The child iteration and helpers manage lifetimes sufficiently,
+	 * and putting here has triggered of_node_release() errors on Pi5.
+	 */
 	return ret;
 }
 
@@ -962,6 +1003,7 @@ static int seeed_voice_card_probe(struct platform_device *pdev)
 	ret = devm_snd_soc_register_card(&pdev->dev, &priv->snd_card);
 	if (ret >= 0)
 		return ret;
+	dev_err(dev, "register card failed: %d\n", ret);
 
 err:
 	simple_util_clean_reference(&priv->snd_card);

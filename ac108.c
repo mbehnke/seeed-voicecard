@@ -427,17 +427,18 @@ static const struct snd_soc_dapm_route ac108_dapm_routes[] = {
 
 	{ "DSM EN", NULL, "ADC EN" },
 
-	{ "Channel 1 EN", NULL, "MIC1P" },
-	{ "Channel 1 EN", NULL, "MIC1N" },
+	/* Connect MIC inputs to MICBIAS widgets (not to supply widgets) */
+	{ "MIC1BIAS", NULL, "MIC1P" },
+	{ "MIC1BIAS", NULL, "MIC1N" },
 
-	{ "Channel 2 EN", NULL, "MIC2P" },
-	{ "Channel 2 EN", NULL, "MIC2N" },
+	{ "MIC2BIAS", NULL, "MIC2P" },
+	{ "MIC2BIAS", NULL, "MIC2N" },
 
-	{ "Channel 3 EN", NULL, "MIC3P" },
-	{ "Channel 3 EN", NULL, "MIC3N" },
+	{ "MIC3BIAS", NULL, "MIC3P" },
+	{ "MIC3BIAS", NULL, "MIC3N" },
 
-	{ "Channel 4 EN", NULL, "MIC4P" },
-	{ "Channel 4 EN", NULL, "MIC4N" },
+	{ "MIC4BIAS", NULL, "MIC4P" },
+	{ "MIC4BIAS", NULL, "MIC4N" },
 
 };
 
@@ -730,6 +731,36 @@ static int ac108_hw_params(struct snd_pcm_substream *substream, struct snd_pcm_h
 	ac108_multi_write(ADC2_DVOL_CTRL, 0xC0, ac10x);
 	ac108_multi_write(ADC3_DVOL_CTRL, 0xC0, ac10x);
 	ac108_multi_write(ADC4_DVOL_CTRL, 0xC0, ac10x);
+
+	/* Check critical control registers for issues */
+	{
+		u8 ana_ctrl3 = 0, pwr_ctrl9 = 0, sysclk_ctrl = 0;
+		ac10x_read(ANA_ADC1_CTRL3, &ana_ctrl3, ac10x->i2cmap[0]);
+		ac10x_read(PWR_CTRL9, &pwr_ctrl9, ac10x->i2cmap[0]);
+		ac10x_read(SYSCLK_CTRL, &sysclk_ctrl, ac10x->i2cmap[0]);
+		pr_info("ac108: [startup] ANA_ADC1_CTRL3=0x%02x (bit2=DSM_DIS, bit1=VREFP_DIS, bit0=AAF_DIS - all should be 0)\n", ana_ctrl3);
+		pr_info("ac108: [startup] PWR_CTRL9=0x%02x, SYSCLK_CTRL=0x%02x\n", pwr_ctrl9, sysclk_ctrl);
+	}
+
+	/* Verify register writes succeeded by reading back critical registers */
+	{
+		u8 adc_dig_en = 0, ana_adc1 = 0, dvol1 = 0;
+		ac10x_read(ADC_DIG_EN, &adc_dig_en, ac10x->i2cmap[0]);
+		ac10x_read(ANA_ADC1_CTRL1, &ana_adc1, ac10x->i2cmap[0]);
+		ac10x_read(ADC1_DVOL_CTRL, &dvol1, ac10x->i2cmap[0]);
+		pr_info("ac108: [startup] Register readback: ADC_DIG_EN=0x%02x (expect 0x1F), ANA_ADC1_CTRL1=0x%02x (expect 0x0E), ADC1_DVOL=0x%02x (expect 0xC0)\n",
+			adc_dig_en, ana_adc1, dvol1);
+	}
+
+	/* Verify register writes succeeded by reading back critical registers */
+	{
+		u8 adc_dig_en = 0, ana_adc1 = 0, dvol1 = 0;
+		ac10x_read(ADC_DIG_EN, &adc_dig_en, ac10x->i2cmap[0]);
+		ac10x_read(ANA_ADC1_CTRL1, &ana_adc1, ac10x->i2cmap[0]);
+		ac10x_read(ADC1_DVOL_CTRL, &dvol1, ac10x->i2cmap[0]);
+		pr_info("ac108: [startup] Register readback: ADC_DIG_EN=0x%02x (expect 0x1F), ANA_ADC1_CTRL1=0x%02x (expect 0x0E), ADC1_DVOL=0x%02x (expect 0xC0)\n",
+			adc_dig_en, ana_adc1, dvol1);
+	}
 	
 	/* Debug: Check if startup was called (TXEN should be 1) */
 	{
@@ -869,6 +900,19 @@ static int ac108_hw_params(struct snd_pcm_substream *substream, struct snd_pcm_h
 		ac108_config_pll(ac10x, ac108_sample_rate[rate].real_val, 0);
 	}
 
+	/* Verify PLL and SYSCLK were enabled by config_pll */
+	{
+		u8 sysclk_ctrl = 0, pll_ctrl1 = 0, i2s_fmt1 = 0, i2s_fmt2 = 0;
+		ac10x_read(SYSCLK_CTRL, &sysclk_ctrl, ac10x->i2cmap[0]);
+		ac10x_read(PLL_CTRL1, &pll_ctrl1, ac10x->i2cmap[0]);
+		ac10x_read(I2S_FMT_CTRL1, &i2s_fmt1, ac10x->i2cmap[0]);
+		ac10x_read(I2S_FMT_CTRL2, &i2s_fmt2, ac10x->i2cmap[0]);
+		pr_info("ac108: [hw_params] After config_pll: SYSCLK_CTRL=0x%02x (expect 0x89: PLL_EN|SYSCLK_EN), PLL_CTRL1=0x%02x (bit2=PLL_LOCKED=%d)\n",
+			sysclk_ctrl, pll_ctrl1, (pll_ctrl1 >> 2) & 1);
+		pr_info("ac108: [hw_params] I2S_FMT_CTRL1=0x%02x (bits[5:4]=MODE_SEL: 0=I2S,1=LJ,2=RJ,3=PCM), I2S_FMT_CTRL2=0x%02x (bits[7:4]=SLOT_WIDTH,bits[3:0]=SAMP_RES)\n",
+			i2s_fmt1, i2s_fmt2);
+	}
+
 	/*
 	 * master mode only
 	 */
@@ -959,7 +1003,8 @@ static int ac108_set_fmt(struct snd_soc_dai *dai, unsigned int fmt) {
 	unsigned char tx_offset, lrck_polarity, brck_polarity;
 	struct ac10x_priv *ac10x = dev_get_drvdata(dai->dev);
 
-	dev_dbg(dai->dev, "%s\n", __FUNCTION__);
+	dev_info(dai->dev, "ac108_set_fmt: fmt=0x%04x, master_bits=0x%04x\n",
+		 fmt, (fmt & SND_SOC_DAIFMT_MASTER_MASK));
 
 	switch (fmt & SND_SOC_DAIFMT_MASTER_MASK) {
 	case SND_SOC_DAIFMT_CBM_CFM:    /*AC108 Master*/
@@ -979,14 +1024,15 @@ static int ac108_set_fmt(struct snd_soc_dai *dai, unsigned int fmt) {
 		}
 		fallthrough;
 	case SND_SOC_DAIFMT_CBS_CFS:    /*AC108 Slave*/
-		dev_dbg(dai->dev, "AC108 set to work as Slave\n");
+		dev_info(dai->dev, "ac108_set_fmt: Setting AC108 to SLAVE mode (CPU is I2S master)\n");
 		/**
-		 * 0x30:chip is slave mode, BCLK & LRCK input, enable SDO1_EN and 
+		 * 0x30:chip is slave mode, BCLK & LRCK input, enable SDO1_EN and
 		 *  SDO2_EN, Transmitter Block Enable, Globe Enable
 		 *  NOTE: Even in slave mode, we need TXEN=1 for AC108 to transmit ADC data on I2S
 		 */
 		ac108_multi_update_bits(I2S_CTRL, 0x03 << LRCK_IOEN | 0x03 << SDO1_EN | 0x1 << TXEN | 0x1 << GEN,
 						  0x00 << LRCK_IOEN | 0x03 << SDO1_EN | 0x1 << TXEN | 0x1 << GEN, ac10x);
+		dev_info(dai->dev, "ac108_set_fmt: AC108 configured as SLAVE\n");
 		break;
 	default:
 		pr_err("AC108 Master/Slave mode config error:%u\n\n", (fmt & SND_SOC_DAIFMT_MASTER_MASK) >> 12);
@@ -997,7 +1043,7 @@ static int ac108_set_fmt(struct snd_soc_dai *dai, unsigned int fmt) {
 	switch (fmt & SND_SOC_DAIFMT_FORMAT_MASK) {
 	case SND_SOC_DAIFMT_I2S:
 		dev_dbg(dai->dev, "AC108 config I2S format\n");
-		ac10x->i2s_mode = LEFT_JUSTIFIED_FORMAT;
+		ac10x->i2s_mode = 0;  /* I2S mode (MODE_SEL = 0) - was incorrectly set to LEFT_JUSTIFIED_FORMAT */
 		tx_offset = 1;
 		break;
 	case SND_SOC_DAIFMT_RIGHT_J:
@@ -1105,7 +1151,7 @@ static int ac108_set_clock(int y_start_n_stop, struct snd_pcm_substream *substre
 	u8 reg;
 	int ret = 0;
 
-	dev_dbg(ac10x->codec->dev, "%s() L%d cmd:%d\n", __func__, __LINE__, y_start_n_stop);
+	pr_info("ac108: [set_clock] CALLED: y_start_n_stop=%d, sysclk_en=%lu\n", y_start_n_stop, ac10x->sysclk_en);
 
 	/* spin_lock move to machine trigger */
 
@@ -1113,6 +1159,7 @@ static int ac108_set_clock(int y_start_n_stop, struct snd_pcm_substream *substre
 		ac101_trigger(substream, cmd, dai);
 	}
 	if (y_start_n_stop && ac10x->sysclk_en == 0) {
+		pr_info("ac108: [set_clock] Enabling PLL and clocks (sysclk_en was 0)\n");
 		/* enable lrck clock */
 		ac10x_read(I2S_CTRL, &reg, ac10x->i2cmap[_MASTER_INDEX]);
 		if (reg & (0x01 << BCLK_IOEN)) {
@@ -1129,6 +1176,14 @@ static int ac108_set_clock(int y_start_n_stop, struct snd_pcm_substream *substre
 						   0x01 << PLL_EN | 0x01 << PLL_COM_EN, ac10x);
 		/* enable global clock */
 		ret = ret || ac108_multi_update_bits(I2S_CTRL, 0x1 << TXEN | 0x1 << GEN, 0x1 << TXEN | 0x1 << GEN, ac10x);
+
+		/* Verify PLL was enabled and check lock status */
+		{
+			u8 pll_ctrl1 = 0;
+			ac10x_read(PLL_CTRL1, &pll_ctrl1, ac10x->i2cmap[0]);
+			pr_info("ac108: [set_clock] After enabling: PLL_CTRL1=0x%02x (bit0=PLL_EN=%d, bit2=LOCKED=%d)\n",
+				pll_ctrl1, pll_ctrl1 & 1, (pll_ctrl1 >> 2) & 1);
+		}
 
 		ac10x->sysclk_en = 1UL;
 	} else if (!y_start_n_stop && ac10x->sysclk_en != 0) {
@@ -1236,6 +1291,15 @@ int ac108_audio_startup(struct snd_pcm_substream *substream,
 		ac108_multi_write(MOD_RST_CTRL,
 			(0x1 << I2S) | (0x1 << ADC_DIGITAL) | (0x1 << ADC_ANALOG),
 			ac10x);
+
+		/* Verify clock and reset registers */
+		{
+			u8 mod_clk = 0, mod_rst = 0;
+			ac10x_read(MOD_CLK_EN, &mod_clk, ac10x->i2cmap[0]);
+			ac10x_read(MOD_RST_CTRL, &mod_rst, ac10x->i2cmap[0]);
+			pr_info("ac108: [startup] MOD_CLK_EN=0x%02x (expect 0x91: I2S|ADC_DIG|ADC_ANA), MOD_RST_CTRL=0x%02x (expect 0x91)\n",
+				mod_clk, mod_rst);
+		}
 		/* Enable I2S TX1 output and SDO1 */
 		ac10x_update_bits(I2S_CTRL,
 			(0x1 << SDO1_EN) | (0x1 << TXEN) | (0x1 << GEN),
@@ -1274,12 +1338,15 @@ int ac108_audio_startup(struct snd_pcm_substream *substream,
 		}
 
 		/* Enable ADC digital blocks and all 4 channels */
+		pr_info("ac108: [startup] Enabling ADC digital blocks - DG_EN and ENAD1-4\n");
 		ac108_multi_update_bits(ADC_DIG_EN,
 			(0x1 << DG_EN) | (0x1 << ENAD1) | (0x1 << ENAD2) | (0x1 << ENAD3) | (0x1 << ENAD4),
 			(0x1 << DG_EN) | (0x1 << ENAD1) | (0x1 << ENAD2) | (0x1 << ENAD3) | (0x1 << ENAD4),
 			ac10x);
+		pr_info("ac108: [startup] ADC digital blocks enabled\n");
 
 		/* Enable ANA path: MICBIAS, PGA and DSM per channel */
+		pr_info("ac108: [startup] Enabling analog path - MICBIAS, PGA, DSM, unmuting PGA\n");
 		ac108_multi_update_bits(ANA_ADC1_CTRL1,
 			(0x1 << ADC1_MICBIAS_EN) | (0x1 << ADC1_PGA_ENABLE) | (0x1 << ADC1_DSM_ENABLE) | (0x1 << ADC1_PGA_MUTE),
 			(0x1 << ADC1_MICBIAS_EN) | (0x1 << ADC1_PGA_ENABLE) | (0x1 << ADC1_DSM_ENABLE) | (0x0 << ADC1_PGA_MUTE),
@@ -1298,10 +1365,12 @@ int ac108_audio_startup(struct snd_pcm_substream *substream,
 			ac10x);
 
 		/* Set a safe default digital volume to avoid mute (per channel) */
+		pr_info("ac108: [startup] Setting digital volumes to 0xC0\n");
 		ac108_multi_write(ADC1_DVOL_CTRL, 0xC0, ac10x);
 		ac108_multi_write(ADC2_DVOL_CTRL, 0xC0, ac10x);
 		ac108_multi_write(ADC3_DVOL_CTRL, 0xC0, ac10x);
 		ac108_multi_write(ADC4_DVOL_CTRL, 0xC0, ac10x);
+		pr_info("ac108: [startup] ✅ COMPLETE - All ADC channels enabled and configured\n");
 	}
 
 	if (ac10x->i2c101) {
@@ -1441,7 +1510,7 @@ static int ac108_codec_probe(struct snd_soc_codec *codec) {
 static int ac108_set_bias_level(struct snd_soc_codec *codec, enum snd_soc_bias_level level) {
 	struct ac10x_priv *ac10x = snd_soc_codec_get_drvdata(codec);
 
-	dev_dbg(codec->dev, "AC108 level:%d\n", level);
+	dev_info(codec->dev, "ac108_set_bias_level: Transitioning to level %d (0=Off, 1=Standby, 2=Prepare, 3=On)\n", level);
 
 	switch (level) {
 	case SND_SOC_BIAS_ON:
@@ -1697,11 +1766,16 @@ __ret:
 			int (*register_set_clock)(int,
 				int (*)(int, struct snd_pcm_substream *, int, struct snd_soc_dai *));
 
+			pr_info("ac108: Attempting to register set_clock callback...\n");
 			sym = __symbol_get("seeed_voice_card_register_set_clock");
 			if (sym) {
+				pr_info("ac108: Symbol found! Registering set_clock callback for CAPTURE stream\n");
 				register_set_clock = sym;
 				register_set_clock(SNDRV_PCM_STREAM_CAPTURE, ac108_set_clock);
 				__symbol_put("seeed_voice_card_register_set_clock");
+				pr_info("ac108: set_clock callback registered successfully\n");
+			} else {
+				pr_err("ac108: FAILED to get symbol 'seeed_voice_card_register_set_clock' - PLL will not be enabled!\n");
 			}
 		}
 		/* no playback stream */
