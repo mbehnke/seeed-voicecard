@@ -554,6 +554,7 @@ static int ac108_config_pll(struct ac10x_priv *ac10x, unsigned rate, unsigned lr
 		ac108_multi_update_bits(PLL_LOCK_CTRL, 0x1 << PLL_LOCK_EN, 0x1 << PLL_LOCK_EN, ac10x);
 
 		/**
+		pr_info("ac108: [config_pll] Wrote PLL dividers, M1=%u M2=%u N=%u K1=%u K2=%u\n", ac108_pll_div.m1, ac108_pll_div.m2, ac108_pll_div.n, ac108_pll_div.k1, ac108_pll_div.k2);
 		 * 0x20: enable pll, pll source from mclk/bclk, sysclk source from pll, enable sysclk
 		 */
 		ac108_multi_update_bits(SYSCLK_CTRL, 0x01 << PLLCLK_EN | 0x03  << PLLCLK_SRC | 0x01 << SYSCLK_SRC | 0x01 << SYSCLK_EN,
@@ -897,7 +898,8 @@ static int ac108_hw_params(struct snd_pcm_substream *substream, struct snd_pcm_h
 	if (ac10x->i2c101 && _MASTER_MULTI_CODEC == _MASTER_AC101) {
 		ac108_config_pll(ac10x, ac108_sample_rate[rate].real_val, ac108_samp_res[samp_res].real_val * channels);
 	} else {
-		ac108_config_pll(ac10x, ac108_sample_rate[rate].real_val, 0);
+		pr_info("ac108: [hw_params] Using BCLK as PLL source (RPi5 fix): lrck_ratio=%u\n", ac108_samp_res[samp_res].real_val * channels);
+		ac108_config_pll(ac10x, ac108_sample_rate[rate].real_val, ac108_samp_res[samp_res].real_val * channels);
 	}
 
 	/* Verify PLL and SYSCLK were enabled by config_pll */
@@ -1031,7 +1033,7 @@ static int ac108_set_fmt(struct snd_soc_dai *dai, unsigned int fmt) {
 		 *  NOTE: Even in slave mode, we need TXEN=1 for AC108 to transmit ADC data on I2S
 		 */
 		ac108_multi_update_bits(I2S_CTRL, 0x03 << LRCK_IOEN | 0x03 << SDO1_EN | 0x1 << TXEN | 0x1 << GEN,
-						  0x00 << LRCK_IOEN | 0x03 << SDO1_EN | 0x1 << TXEN | 0x1 << GEN, ac10x);
+						  0x03 << LRCK_IOEN | 0x03 << SDO1_EN | 0x1 << TXEN | 0x1 << GEN, ac10x);
 		dev_info(dai->dev, "ac108_set_fmt: AC108 configured as SLAVE\n");
 		break;
 	default:
@@ -1145,6 +1147,85 @@ static int ac108_set_fmt(struct snd_soc_dai *dai, unsigned int fmt) {
 }
 
 /*
+ * Delayed work function to enable PLL after BCLK has started.
+ * BCLK from DesignWare I2S on RPi5 doesn't start until after the trigger callback returns.
+ */
+static void ac108_pll_work(struct work_struct *work)
+{
+	struct ac10x_priv *ac10x = container_of(work, struct ac10x_priv, pll_work.work);
+	int ret = 0;
+	int i;
+	u8 pll_ctrl1 = 0;
+	u8 i2s_ctrl = 0;
+
+	pr_info("ac108: [pll_work] Starting delayed PLL enable\n");
+
+	/* First ensure I2S_CTRL has BCLK_IOEN and LRCK_IOEN enabled */
+	ac10x_read(I2S_CTRL, &i2s_ctrl, ac10x->i2cmap[_MASTER_INDEX]);
+	pr_info("ac108: [pll_work] I2S_CTRL before=0x%02x\n", i2s_ctrl);
+
+	/* Enable BCLK_IOEN and LRCK_IOEN for slave mode */
+	ret = ac10x_update_bits(I2S_CTRL, 0x03 << LRCK_IOEN, 0x03 << LRCK_IOEN, ac10x->i2cmap[_MASTER_INDEX]);
+
+	ac10x_read(I2S_CTRL, &i2s_ctrl, ac10x->i2cmap[_MASTER_INDEX]);
+	pr_info("ac108: [pll_work] I2S_CTRL after LRCK_IOEN set=0x%02x\n", i2s_ctrl);
+
+	/*0x21: Module clock enable <I2S, ADC digital, ADC analog>*/
+	ret = ret || ac108_multi_write(MOD_CLK_EN, (0x1 << I2S) | (0x1 << ADC_DIGITAL) | (0x1 << ADC_ANALOG), ac10x);
+	/*0x22: Module reset de-asserted <I2S, ADC digital, ADC analog>*/
+	ret = ret || ac108_multi_write(MOD_RST_CTRL, (0x1 << I2S) | (0x1 << ADC_DIGITAL) | (0x1 << ADC_ANALOG), ac10x);
+
+	/* First DISABLE PLL to ensure clean start, then enable after brief delay */
+	ret = ret || ac108_multi_update_bits(PLL_CTRL1, 0x01 << PLL_EN | 0x01 << PLL_COM_EN,
+					   0x00 << PLL_EN | 0x00 << PLL_COM_EN, ac10x);
+	usleep_range(1000, 2000);  /* 1ms delay for PLL to fully disable */
+
+	/*0x10: PLL Common voltage enable, PLL enable */
+	ret = ret || ac108_multi_update_bits(PLL_CTRL1, 0x01 << PLL_EN | 0x01 << PLL_COM_EN,
+					   0x01 << PLL_EN | 0x01 << PLL_COM_EN, ac10x);
+
+	/* Wait for PLL to lock - try up to 50 times with 1ms delay each */
+	for (i = 0; i < 50; i++) {
+		usleep_range(1000, 1500);
+		ac10x_read(PLL_CTRL1, &pll_ctrl1, ac10x->i2cmap[0]);
+		if (pll_ctrl1 & 0x04) {
+			pr_info("ac108: [pll_work] PLL LOCKED after %d ms! PLL_CTRL1=0x%02x\n", i+1, pll_ctrl1);
+			break;
+		}
+	}
+
+	if (!(pll_ctrl1 & 0x04)) {
+		u8 sysclk_ctrl, pll2, pll3, pll4, pll5, pll_lock_ctrl;
+		ac10x_read(SYSCLK_CTRL, &sysclk_ctrl, ac10x->i2cmap[0]);
+		ac10x_read(PLL_CTRL2, &pll2, ac10x->i2cmap[0]);
+		ac10x_read(PLL_CTRL3, &pll3, ac10x->i2cmap[0]);
+		ac10x_read(PLL_CTRL4, &pll4, ac10x->i2cmap[0]);
+		ac10x_read(PLL_CTRL5, &pll5, ac10x->i2cmap[0]);
+		ac10x_read(PLL_LOCK_CTRL, &pll_lock_ctrl, ac10x->i2cmap[0]);
+		pr_err("ac108: [pll_work] PLL FAILED to lock after 50ms!\n");
+		pr_err("ac108: [pll_work]   PLL_CTRL1=0x%02x (EN=%d, COM_EN=%d, LOCKED=%d)\n",
+			pll_ctrl1, pll_ctrl1 & 1, (pll_ctrl1 >> 1) & 1, (pll_ctrl1 >> 2) & 1);
+		pr_err("ac108: [pll_work]   SYSCLK_CTRL=0x%02x (PLLCLK_EN=%d, PLLCLK_SRC=%d, SYSCLK_SRC=%d)\n",
+			sysclk_ctrl, (sysclk_ctrl >> 7) & 1, (sysclk_ctrl >> 4) & 3, (sysclk_ctrl >> 3) & 1);
+		pr_err("ac108: [pll_work]   PLL dividers: M1=%d, M2=%d, N=%d, K1=%d, K2=%d\n",
+			pll2 & 0x1f, (pll2 >> 5) & 1,
+			((pll3 & 0x03) << 8) | pll4,
+			pll5 & 0x1f, (pll5 >> 5) & 1);
+		pr_err("ac108: [pll_work]   PLL_LOCK_CTRL=0x%02x (LOCK_EN=%d)\n",
+			pll_lock_ctrl, pll_lock_ctrl & 1);
+	}
+
+	/* enable global clock and TX */
+	ret = ret || ac108_multi_update_bits(I2S_CTRL, 0x1 << TXEN | 0x1 << GEN, 0x1 << TXEN | 0x1 << GEN, ac10x);
+
+	ac10x_read(I2S_CTRL, &i2s_ctrl, ac10x->i2cmap[_MASTER_INDEX]);
+	pr_info("ac108: [pll_work] I2S_CTRL final=0x%02x\n", i2s_ctrl);
+
+	ac10x->sysclk_en = 1UL;
+	ac10x->pll_pending = 0;
+}
+
+/*
  * due to miss channels order in cpu_dai, we meed defer the clock starting.
  */
 static int ac108_set_clock(int y_start_n_stop, struct snd_pcm_substream *substream, int cmd, struct snd_soc_dai *dai) {
@@ -1158,55 +1239,29 @@ static int ac108_set_clock(int y_start_n_stop, struct snd_pcm_substream *substre
 	if (y_start_n_stop && ac10x->i2c101 && _MASTER_MULTI_CODEC == _MASTER_AC101) {
 		ac101_trigger(substream, cmd, dai);
 	}
-	if (y_start_n_stop && ac10x->sysclk_en == 0) {
-		pr_info("ac108: [set_clock] Enabling PLL and clocks (sysclk_en was 0)\n");
-		/* enable lrck clock */
-		ac10x_read(I2S_CTRL, &reg, ac10x->i2cmap[_MASTER_INDEX]);
-		if (reg & (0x01 << BCLK_IOEN)) {
-			ret = ret || ac10x_update_bits(I2S_CTRL, 0x03 << LRCK_IOEN, 0x03 << LRCK_IOEN, ac10x->i2cmap[_MASTER_INDEX]);
+	if (y_start_n_stop && ac10x->sysclk_en == 0 && !ac10x->pll_pending) {
+		pr_info("ac108: [set_clock] Scheduling delayed PLL enable (BCLK not running yet)\n");
+		/*
+		 * On RPi5 with DesignWare I2S, BCLK doesn't start until AFTER this callback returns.
+		 * We must defer PLL enable until BCLK is running, otherwise PLL can't lock.
+		 * Schedule delayed work to enable PLL after 50ms (giving BCLK time to start and stabilize).
+		 */
+		ac10x->pll_pending = 1;
+		schedule_delayed_work(&ac10x->pll_work, msecs_to_jiffies(50));
+	} else if (!y_start_n_stop && (ac10x->sysclk_en != 0 || ac10x->pll_pending)) {
+		pr_info("ac108: [set_clock] Marking clocks as disabled (no I2C in atomic context)\n");
+		/* Cancel any pending PLL work - use non-blocking version since we're in atomic context */
+		if (ac10x->pll_pending) {
+			cancel_delayed_work(&ac10x->pll_work);
+			ac10x->pll_pending = 0;
 		}
-
-		/*0x21: Module clock enable <I2S, ADC digital, ADC analog>*/
-		ret = ret || ac108_multi_write(MOD_CLK_EN, (0x1 << I2S) | (0x1 << ADC_DIGITAL) | (0x1 << ADC_ANALOG), ac10x);
-		/*0x22: Module reset de-asserted <I2S, ADC digital, ADC analog>*/
-		ret = ret || ac108_multi_write(MOD_RST_CTRL, (0x1 << I2S) | (0x1 << ADC_DIGITAL) | (0x1 << ADC_ANALOG), ac10x);
-
-		/*0x10: PLL Common voltage enable, PLL enable */
-		ret = ret || ac108_multi_update_bits(PLL_CTRL1, 0x01 << PLL_EN | 0x01 << PLL_COM_EN,
-						   0x01 << PLL_EN | 0x01 << PLL_COM_EN, ac10x);
-		/* enable global clock */
-		ret = ret || ac108_multi_update_bits(I2S_CTRL, 0x1 << TXEN | 0x1 << GEN, 0x1 << TXEN | 0x1 << GEN, ac10x);
-
-		/* Verify PLL was enabled and check lock status */
-		{
-			u8 pll_ctrl1 = 0;
-			ac10x_read(PLL_CTRL1, &pll_ctrl1, ac10x->i2cmap[0]);
-			pr_info("ac108: [set_clock] After enabling: PLL_CTRL1=0x%02x (bit0=PLL_EN=%d, bit2=LOCKED=%d)\n",
-				pll_ctrl1, pll_ctrl1 & 1, (pll_ctrl1 >> 2) & 1);
-		}
-
-		ac10x->sysclk_en = 1UL;
-	} else if (!y_start_n_stop && ac10x->sysclk_en != 0) {
-		/* disable global clock */
-		ret = ret || ac108_multi_update_bits(I2S_CTRL, 0x1 << TXEN | 0x1 << GEN, 0x0 << TXEN | 0x0 << GEN, ac10x);
-
-		/*0x10: PLL Common voltage disable, PLL disable */
-		ret = ret || ac108_multi_update_bits(PLL_CTRL1, 0x01 << PLL_EN | 0x01 << PLL_COM_EN,
-						   0x00 << PLL_EN | 0x00 << PLL_COM_EN, ac10x);
-
-		/*0x21: Module clock disable*/
-		ret = ret || ac108_multi_write(MOD_CLK_EN, 0x0, ac10x);
-		/*0x22: Module reset assert*/
-		ret = ret || ac108_multi_write(MOD_RST_CTRL, 0x0, ac10x);
-
-		/* disable lrck clock if it's enabled */
-		ac10x_read(I2S_CTRL, &reg, ac10x->i2cmap[_MASTER_INDEX]);
-		if (reg & (0x01 << LRCK_IOEN)) {
-			ret = ret || ac10x_update_bits(I2S_CTRL, 0x03 << LRCK_IOEN, 0x01 << BCLK_IOEN, ac10x->i2cmap[_MASTER_INDEX]);
-		}
-		if (!ret) {
-			ac10x->sysclk_en = 0UL;
-		}
+		/*
+		 * NOTE: We can't do I2C operations here because we're in atomic context (spinlock held).
+		 * The DesignWare I2C controller on RPi5 needs to schedule, which causes BUG.
+		 * Just mark clocks as disabled - they'll be reconfigured on next start.
+		 * The AC108 hardware will keep running but that's OK.
+		 */
+		ac10x->sysclk_en = 0UL;
 	}
 
 	return ret;
@@ -1703,6 +1758,9 @@ static int ac108_i2c_probe(struct i2c_client *i2c) {
 			dev_err(&i2c->dev, "Unable to allocate ac10x private data\n");
 			return -ENOMEM;
 		}
+		/* Initialize PLL delayed work for deferred PLL enable on RPi5 */
+		INIT_DELAYED_WORK(&ac10x->pll_work, ac108_pll_work);
+		ac10x->pll_pending = 0;
 	}
 
 	index = (int)i2c_match_id(ac108_i2c_id, i2c)->driver_data;
@@ -1792,6 +1850,9 @@ __ret:
 }
 
 static void ac108_i2c_remove(struct i2c_client *i2c) {
+	/* Cancel any pending PLL work */
+	cancel_delayed_work_sync(&ac10x->pll_work);
+
 	if (ac10x->codec != NULL) {
 		snd_soc_unregister_codec(&ac10x->i2c[_MASTER_INDEX]->dev);
 		ac10x->codec = NULL;
@@ -1843,5 +1904,6 @@ static struct i2c_driver ac108_i2c_driver = {
 module_i2c_driver(ac108_i2c_driver);
 
 MODULE_DESCRIPTION("ASoC AC108 driver");
+MODULE_SOFTDEP("pre: snd-soc-seeed-voicecard");
 MODULE_AUTHOR("Baozhu Zuo<zuobaozhu@gmail.com>");
 MODULE_LICENSE("GPL");

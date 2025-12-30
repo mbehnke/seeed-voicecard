@@ -1,0 +1,19 @@
+/dts-v1/;
+/plugin/;
+
+/*
+ * Minimal overlay to add TDM slot configuration to existing seeed-voice-card CPU DAI
+ * This fixes the BCLK ratio for 4-channel audio (4 slots * 32 bits = 128)
+ */
+
+/ {
+	compatible = "brcm,bcm2712";
+
+	fragment@0 {
+		target-path = "/sound/seeed-voice-card,dai-link/seeed-voice-card,cpu";
+		__overlay__ {
+			dai-tdm-slot-num = <4>;
+			dai-tdm-slot-width = <32>;
+		};
+	};
+};

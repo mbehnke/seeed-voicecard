@@ -54,6 +54,10 @@
 
 				cpu_dai: seeed-voice-card,cpu {
 					sound-dai = <&i2s>;
+					/* TDM slot configuration for 4-channel audio */
+					/* BCLK ratio = slots * width = 4 * 32 = 128 */
+					dai-tdm-slot-num = <4>;
+					dai-tdm-slot-width = <32>;
 				};
 
 				codec_dai: seeed-voice-card,codec {
