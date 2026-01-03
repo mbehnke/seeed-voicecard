@@ -123,11 +123,24 @@ static int seeed_voice_card_startup(struct snd_pcm_substream *substream)
 	 */
 	if (substream->runtime) {
 		unsigned int ch = 0;
+		int tdm_disabled = (dai_props->cpu_dai.slots == 0);
 
 		if (substream->stream == SNDRV_PCM_STREAM_CAPTURE)
 			ch = priv->channels_capture_override;
 		else
 			ch = priv->channels_playback_override;
+
+		/*
+		 * RP1 designware-i2s fallback: if TDM is disabled and we requested >2ch,
+		 * constrain to 2ch to allow partial operation rather than failure.
+		 */
+		if (tdm_disabled && ch > 2) {
+			dev_warn(rtd->dev,
+				"RP1 FALLBACK: TDM disabled, constraining to 2-channel %s\n"
+				"  (requested %u ch but RP1 designware-i2s only supports 2 without TDM)\n",
+				snd_pcm_stream_str(substream), ch);
+			ch = 2;
+		}
 
 		if (ch) {
 			ret = snd_pcm_hw_constraint_minmax(substream->runtime,
@@ -169,75 +182,62 @@ static int seeed_voice_card_hw_params(struct snd_pcm_substream *substream,
 	struct seeed_dai_props *dai_props =
 		seeed_priv_to_props(priv, rtd->num);
 	unsigned int mclk, mclk_fs = 0;
-	unsigned int request_ch = params_channels(params);
 	int ret = 0;
-	int tdm_disabled = 0;
 
 	dev_info(rtd->dev, "=== hw_params ENTER: rate=%u channels=%u ===\n",
 		params_rate(params), params_channels(params));
 
-	/* Configure TDM slots if specified in device tree */
-	/* NOTE: RPi 5 designware-i2s does NOT support TDM - skip TDM configuration */
+	/* RPi 5 RP1 designware-i2s does NOT support TDM - clear any DT settings */
 	if (dai_props->cpu_dai.slots) {
-		pr_info("seeed-voicecard: %s: Skipping CPU DAI TDM config (not supported on RPi5)\n", __func__);
-		/* TDM not supported on RPi 5 - just log and continue */
-		dev_info(rtd->dev, "TDM requested but NOT applied (RPi5 hw limitation)\n");
-		/* Clear TDM settings to prevent snd_soc_dai_set_tdm_slot call */
+		dev_info(rtd->dev, "Clearing TDM config (RPi5 RP1 limitation)\n");
 		dai_props->cpu_dai.slots = 0;
 		dai_props->codec_dai.slots = 0;
-		tdm_disabled = 1;
 	}
 
 	/*
-	 * RP1 designware-i2s hw_params rejection for >2ch (-EINVAL).
-	 * Fallback: if TDM is disabled and channels > 2, constrain to 2ch
-	 * to allow partial operation rather than complete failure.
-	 * This is logged so users understand the limitation.
+	 * RP5 Solution Path Selection via compile-time defines:
+	 * - RP5_2CH_WORKAROUND: Force 2ch with explicit BCLK (stable, 2 mics only)
+	 * - RP5_TDM_SLOTS: Try TDM slot programming for 4ch (experimental)
+	 * - Default: Standard I2S, relies on startup constraint
 	 */
-	if (tdm_disabled && request_ch > 2) {
-		dev_warn(rtd->dev,
-			"⚠️  RP1 CONSTRAINT: Requested %u channels but TDM disabled\n"
-			"   Downgrading to 2-channel capture (RP1 designware-i2s limitation)\n"
-			"   To use >2 channels, rebuild with RP1 TDM support or use software mixing\n",
-			request_ch);
-		request_ch = 2;
+#ifdef RP5_2CH_WORKAROUND
+	/* SOLUTION A: 2-Channel forced mode with explicit BCLK timing */
+	{
+		unsigned int bclk_ratio = 64; /* 2ch * 32bit */
+		dev_info(rtd->dev, "[RP5_2CH_WORKAROUND] BCLK ratio=%u\n", bclk_ratio);
+		
+		ret = snd_soc_dai_set_bclk_ratio(cpu_dai, bclk_ratio);
+		if (ret && ret != -ENOTSUPP)
+			dev_warn(rtd->dev, "BCLK ratio failed: %d (non-critical)\n", ret);
 	}
-
-	/*
-	 * On RP1 (designware-i2s) we still need explicit slot programming for
-	 * >2 channels even in I2S mode. Without slots, hw_params returns -22
-	 * for 4-ch capture. Program 4 slots of 32 bits when channels > 2.
-	 */
-	if (request_ch > 2) {
-		unsigned int slots = request_ch;
+#elif defined(RP5_TDM_SLOTS)
+	/* SOLUTION B: Explicit TDM slot programming (experimental) */
+	if (params_channels(params) > 2) {
+		unsigned int slots = params_channels(params);
 		unsigned int slot_width = 32;
 		unsigned int mask = (1 << slots) - 1;
-
-		ret = snd_soc_dai_set_tdm_slot(cpu_dai, mask, mask, slots, slot_width);
-		if (ret && ret != -ENOTSUPP) {
-			dev_err(rtd->dev, "CPU DAI set_tdm_slot failed: %d (slots=%u width=%u)\n",
-				ret, slots, slot_width);
-			goto err;
-		}
-
-		ret = snd_soc_dai_set_tdm_slot(codec_dai, mask, mask, slots, slot_width);
-		if (ret && ret != -ENOTSUPP) {
-			dev_err(rtd->dev, "CODEC DAI set_tdm_slot failed: %d (slots=%u width=%u)\n",
-				ret, slots, slot_width);
-			goto err;
-		}
-
-		ret = snd_soc_dai_set_bclk_ratio(cpu_dai, slots * slot_width);
-		if (ret && ret != -ENOTSUPP) {
-			dev_err(rtd->dev, "CPU DAI set_bclk_ratio failed: %d (ratio=%u)\n",
-				ret, slots * slot_width);
-			goto err;
-		}
-
+		
 		dev_info(rtd->dev,
-			"Applied RP1 TDM slots: slots=%u width=%u mask=0x%x bclk_ratio=%u\n",
-			slots, slot_width, mask, slots * slot_width);
+			"[RP5_TDM_SLOTS] slots=%u width=%u mask=0x%x\n",
+			slots, slot_width, mask);
+		
+		ret = snd_soc_dai_set_tdm_slot(cpu_dai, mask, mask, slots, slot_width);
+		if (ret && ret != -ENOTSUPP)
+			dev_err(rtd->dev, "CPU TDM failed: %d\n", ret);
+		
+		ret = snd_soc_dai_set_tdm_slot(codec_dai, mask, mask, slots, slot_width);
+		if (ret && ret != -ENOTSUPP)
+			dev_err(rtd->dev, "Codec TDM failed: %d\n", ret);
+		
+		ret = snd_soc_dai_set_bclk_ratio(cpu_dai, slots * slot_width);
+		if (ret && ret != -ENOTSUPP)
+			dev_warn(rtd->dev, "BCLK ratio failed: %d (non-critical)\n", ret);
 	}
+#else
+	/* SOLUTION DEFAULT: Standard I2S mode (relies on startup constraint for 2ch) */
+	dev_info(rtd->dev, "[DEFAULT] Standard I2S mode, channels=%u\n",
+		params_channels(params));
+#endif
 
 	if (priv->mclk_fs)
 		mclk_fs = priv->mclk_fs;
