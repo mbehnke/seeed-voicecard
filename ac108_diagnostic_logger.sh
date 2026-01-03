@@ -9,6 +9,7 @@
 LOG_DIR="/home/adm_behnke/seeed-voicecard/logs"
 LOG_FILE="$LOG_DIR/ac108_diagnostic_$(date +'%Y%m%d_%H%M%S').log"
 JSON_FILE="$LOG_DIR/ac108_diagnostic_$(date +'%Y%m%d_%H%M%S').json"
+MIN_JSON_FILE="$LOG_DIR/ac108_diag_minimal_$(date +'%Y%m%d_%H%M%S').json"
 I2C_BUS=1
 AC108_ADDR=0x3b
 TEST_DURATION=3  # seconds
@@ -106,47 +107,101 @@ log ""
 
 # --- AC108 Detection ---
 log "=== AC108 DETECTION ==="
-if sudo i2cget -y "$I2C_BUS" "$AC108_ADDR" 0x00 >/dev/null 2>&1; then
-    log "✓ AC108 detected at address $AC108_ADDR"
+skip_i2c_reads=0
+
+# ENHANCED: Check i2cdetect status first
+if echo "$i2c_scan" | grep -q "UU"; then
+    log "⚠️  CRITICAL: Device shows 'UU' at 0x3b (driver owns device but USERSPACE I2C LOCKED)"
+    json_log "ac108_detection" "device_locked_uu"
+    log "This means:"
+    log "  ✓ Kernel driver successfully probed device"
+    log "  ✓ Driver is controlling the device (hence 'UU')"
+    log "  ✗ But userspace i2cget cannot access device"
+    log "  Likely cause: Regmap stuck in cache-only or driver not releasing I2C for userspace"
+    log ""
+    log "DIAGNOSIS: Device is CLAIMED BY KERNEL but hardware doesn't respond"
+    skip_i2c_reads=1
+    json_log "ac108_diagnosis" "kernel_owns_device_but_unreachable"
+elif echo "$i2c_scan" | grep -q " 3b"; then
+    log "✓ AC108 detected at address $AC108_ADDR (device accessible)"
     json_log "ac108_detection" "success"
-    # Try to read chip ID if detected
-    chip_id=$(sudo i2cget -y "$I2C_BUS" "$AC108_ADDR" 0x00 2>/dev/null | awk '{print $1}')
-    if [ -n "$chip_id" ]; then
-        log "  Chip ID: 0x$chip_id"
+else
+    log "✗ AC108 NOT detected at address $AC108_ADDR (no response)"
+    json_log "ac108_detection" "not_detected"
+fi
+
+# Try to read chip ID with detailed error checking unless kernel owns the bus
+log "--- Attempting I2C Read (chip ID @ 0x00) ---"
+if [ "$skip_i2c_reads" -eq 1 ]; then
+    log "Skipping i2cget because driver currently owns device (UU)"
+    json_log "i2cget_status" "skipped_driver_owns_bus"
+else
+    i2c_read_output=$(sudo i2cget -y "$I2C_BUS" "$AC108_ADDR" 0x00 2>&1)
+    i2c_read_status=$?
+
+    if [ $i2c_read_status -eq 0 ]; then
+        chip_id=$(echo "$i2c_read_output" | awk '{print $1}')
+        log "✓ i2cget SUCCESS: Chip ID = 0x$chip_id"
+        json_log "i2cget_status" "success"
         json_log "ac108_chip_id" "0x$chip_id"
     else
-        log "  Warning: Could not read chip ID (I2C communication issue)"
-        json_log "ac108_chip_id" "read_failed"
+        log "✗ i2cget FAILED with error:"
+        log "   Output: $i2c_read_output"
+        log "   Return code: $i2c_read_status"
+        json_log "i2cget_status" "failed"
+        json_log "i2cget_error" "$i2c_read_output"
+		
+        # Analyze error
+        if echo "$i2c_read_output" | grep -q "Device or resource busy"; then
+            log "   ERROR TYPE: 'Device or resource busy' - REGCACHE/DRIVER ISSUE"
+            log "   EXPLANATION: Kernel driver has exclusive access, possibly in cache-only mode"
+            json_log "i2c_error_type" "device_busy_regcache_issue"
+        elif echo "$i2c_read_output" | grep -q "No such device"; then
+            log "   ERROR TYPE: 'No such device' - HARDWARE NOT RESPONDING"
+            json_log "i2c_error_type" "no_device"
+        elif echo "$i2c_read_output" | grep -q "Connection refused"; then
+            log "   ERROR TYPE: 'Connection refused' - I2C BUS ISSUE"
+            json_log "i2c_error_type" "connection_refused"
+        fi
     fi
+fi
+log ""
+
+# Additional I2C troubleshooting
+log "--- I2C BUS DIAGNOSTICS ---"
+if dmesg | grep -q "i2c_designware"; then
+    log "✓ I2C controller: DesignWare (loaded)"
+    json_log "i2c_controller" "designware_loaded"
 else
-    log "✗ AC108 NOT detected at address $AC108_ADDR"
-    json_log "ac108_detection" "failed"
+    log "✗ I2C controller: Not detected in kernel logs"
+    json_log "i2c_controller" "not_detected"
+fi
 
-    # Additional I2C troubleshooting
-    log "--- I2C TROUBLESHOOTING ---"
-    if dmesg | grep -q "i2c_designware"; then
-        log "I2C controller: DesignWare (loaded)"
-        json_log "i2c_controller" "designware_loaded"
-    else
-        log "I2C controller: Not detected in kernel logs"
-        json_log "i2c_controller" "not_detected"
-    fi
+# Check for I2C errors in recent kernel logs
+i2c_errors=$(dmesg | grep -i "i2c.*error\|i2c.*failed" | tail -3)
+if [ -n "$i2c_errors" ]; then
+    log "⚠️  Recent I2C errors in kernel log:"
+    echo "$i2c_errors" | while read line; do
+        log "   $line"
+    done
+    json_log "recent_i2c_errors" "$i2c_errors"
+fi
 
-    # Check I2C bus for any devices
-    if echo "$i2c_scan" | grep -q "UU"; then
-        log "I2C bus shows device in use (UU) at some address"
-        json_log "i2c_bus_status" "device_in_use"
-    else
-        log "I2C bus shows no devices"
-        json_log "i2c_bus_status" "no_devices"
+# Check /proc/devices for I2C
+if [ -f /proc/devices ]; then
+    i2c_device_number=$(grep "i2c-dev" /proc/devices | awk '{print $1}')
+    if [ -n "$i2c_device_number" ]; then
+        log "✓ i2c-dev registered as device $i2c_device_number"
+        json_log "i2c_dev_major_number" "$i2c_device_number"
     fi
 fi
 log ""
 
 # --- ALSA Devices ---
 log "=== ALSA DEVICES ==="
-arecord -l | tee -a "$LOG_FILE"
-json_log "alsa_devices" "$(arecord -l)"
+alsa_devices_output=$(arecord -l 2>&1)
+echo "$alsa_devices_output" | tee -a "$LOG_FILE"
+json_log "alsa_devices" "$alsa_devices_output"
 log ""
 
 # --- Device Tree Configuration ---
@@ -280,21 +335,91 @@ declare -A reg_names=(
 json_array_start "ac108_registers"
 register_read_success=0
 register_read_failed=0
+first_error_logged=0
 
-for reg in "${!reg_names[@]}"; do
-    hex_reg=$reg
+if [ "$skip_i2c_reads" -eq 1 ]; then
+    log "Skipping register reads because kernel currently owns I2C device"
+    json_log "register_communication" "skipped_driver_owns_bus"
+else
+
+# OPTIMIZED: Read fewer registers but with better error analysis
+key_registers=(
+    "0x00:CHIP_ID"
+    "0x20:SYSCLK_CTRL"
+    "0x21:MOD_CLK_EN"
+    "0x22:MOD_RST_CTRL"
+    "0x30:I2S_CTRL"
+)
+
+log "--- KEY REGISTERS (5 critical registers) ---"
+for reg_pair in "${key_registers[@]}"; do
+    reg="${reg_pair%:*}"
+    name="${reg_pair#*:}"
+    
     json_object_start
-    echo "            \"register\": \"${reg_names[$reg]}\"," >> "$JSON_FILE"
+    echo "            \"register\": \"$name\"," >> "$JSON_FILE"
     echo "            \"address\": \"$reg\"," >> "$JSON_FILE"
 
-    if sudo i2cget -y "$I2C_BUS" "$AC108_ADDR" "$hex_reg" >/dev/null 2>&1; then
-        value=$(sudo i2cget -y "$I2C_BUS" "$AC108_ADDR" "$hex_reg" 2>/dev/null | awk '{print $1}')
-        log "${reg_names[$reg]} ($reg): 0x$value"
+    # Try read with timeout
+    reg_output=$(timeout 1 sudo i2cget -y "$I2C_BUS" "$AC108_ADDR" "$reg" 2>&1)
+    reg_status=$?
+    
+    if [ $reg_status -eq 0 ] && [ -n "$reg_output" ]; then
+        value=$(echo "$reg_output" | awk '{print $1}')
+        log "$name ($reg): 0x$value ✓"
         echo "            \"value\": \"0x$value\"," >> "$JSON_FILE"
         echo "            \"status\": \"success\"" >> "$JSON_FILE"
         ((register_read_success++))
     else
-        log "${reg_names[$reg]} ($reg): ✗ FAILED TO READ"
+        error_msg=$(echo "$reg_output" | head -1)
+        log "$name ($reg): ✗ FAILED - $error_msg"
+        echo "            \"value\": \"N/A\"," >> "$JSON_FILE"
+        echo "            \"status\": \"failed\"," >> "$JSON_FILE"
+        echo "            \"error\": \"$error_msg\"" >> "$JSON_FILE"
+        ((register_read_failed++))
+        
+        # Log first error in detail
+        if [ $first_error_logged -eq 0 ]; then
+            log ""
+            log "=== FIRST REGISTER ERROR ANALYSIS ==="
+            log "Register: $name ($reg)"
+            log "Command: i2cget -y 1 0x3b $reg"
+            log "Output: $error_msg"
+            
+            if echo "$error_msg" | grep -q "Device or resource busy"; then
+                log "DIAGNOSIS: Device is busy (kernel driver has exclusive access)"
+                log "ROOT CAUSE: Likely regcache issue or driver not releasing I2C"
+                log "ACTION: Check if regcache_cache_only is disabled in startup"
+                json_log "register_error_root_cause" "regcache_device_busy"
+            elif echo "$error_msg" | grep -q "No such file"; then
+                log "DIAGNOSIS: Device file missing or not accessible"
+                json_log "register_error_root_cause" "device_file_missing"
+            fi
+            log "=== END ANALYSIS ==="
+            log ""
+            first_error_logged=1
+        fi
+    fi
+    json_object_end
+done
+
+log ""
+log "--- READING REMAINING REGISTERS (28 additional) ---"
+# Read remaining registers without individual logging to speed up
+for reg in 0x01 0x10 0x11 0x12 0x13 0x14 0x16 0x17 0x18 0x20 0x31 0x32 0x33 0x34 0x35 0x36 0x60 0x61 0x62 0x64 0x65 0x66 0x68 0x69 0x6A 0x6C 0x6D 0x6E 0x70; do
+    
+    reg_output=$(timeout 1 sudo i2cget -y "$I2C_BUS" "$AC108_ADDR" "$reg" 2>&1)
+    reg_status=$?
+    
+    json_object_start
+    echo "            \"address\": \"$reg\"," >> "$JSON_FILE"
+    
+    if [ $reg_status -eq 0 ] && [ -n "$reg_output" ]; then
+        value=$(echo "$reg_output" | awk '{print $1}')
+        echo "            \"value\": \"0x$value\"," >> "$JSON_FILE"
+        echo "            \"status\": \"success\"" >> "$JSON_FILE"
+        ((register_read_success++))
+    else
         echo "            \"value\": \"N/A\"," >> "$JSON_FILE"
         echo "            \"status\": \"failed\"" >> "$JSON_FILE"
         ((register_read_failed++))
@@ -303,10 +428,37 @@ for reg in "${!reg_names[@]}"; do
 done
 json_array_end
 
-# Summary of register access
-log "Register read summary: $register_read_success successful, $register_read_failed failed"
+# Summary of register access with ROOT CAUSE analysis
+log ""
+log "=== REGISTER READ SUMMARY ==="
+log "Successful: $register_read_success"
+log "Failed: $register_read_failed"
 json_log "register_read_success" "$register_read_success"
 json_log "register_read_failed" "$register_read_failed"
+
+if [ $register_read_failed -eq 33 ]; then
+    log ""
+    log "🔴 CRITICAL: ALL 33 REGISTERS FAILED TO READ"
+    log ""
+    log "ROOT CAUSE ANALYSIS:"
+    log "- Device shows 'UU' in i2cdetect (kernel owns it)"
+    log "- Kernel logs show successful startup"
+    log "- But userspace I2C reads all fail"
+    log ""
+    log "MOST LIKELY CAUSE:"
+    log "1. Regcache stuck in cache-only mode AFTER startup"
+    log "   → Kernel uses cache, hardware not accessible to userspace"
+    log "2. OR: I2C exclusive access lock from kernel not released"
+    log "3. OR: Driver probe succeeded but init incomplete"
+    log ""
+    log "QUICK FIX ATTEMPT:"
+    log "Try reloading modules: sudo rmmod snd_soc_ac108; sudo modprobe snd_soc_ac108"
+    log ""
+    json_log "critical_analysis" "all_registers_failed_kernel_owns_device"
+elif [ $register_read_success -gt 0 ]; then
+    log "✓ Some registers readable - I2C communication partially working"
+    json_log "i2c_status" "partially_working"
+fi
 log ""
 
 # Only proceed with analysis if we could read some registers
@@ -460,6 +612,8 @@ else
     json_log "register_communication" "failed"
 fi
 
+fi
+
 # --- Kernel Logs (AC108/I2S) ---
 log "=== KERNEL LOGS (AC108/I2S) ==="
 kernel_logs=$(dmesg | grep -E "ac108|seeed|designware|I2S_CTRL|PLL" | tail -30)
@@ -503,9 +657,9 @@ if [ -f "$audio_file" ]; then
     echo "$sox_stats" | tee -a "$LOG_FILE"
     json_log "sox_stats" "$sox_stats"
 
-    # Check for silence
+    # Check for silence (without bc - use string comparison)
     max_amplitude=$(echo "$sox_stats" | grep "Maximum amplitude" | awk '{print $3}')
-    if [ "$(echo "$max_amplitude == 0.000000" | bc)" -eq 1 ]; then
+    if [ "$max_amplitude" = "0.000000" ] || [ -z "$max_amplitude" ]; then
         log "✗ Audio file contains ONLY ZEROS (silent capture)"
         json_log "audio_data" "all_zeros"
     else
@@ -625,7 +779,7 @@ if [ $register_read_success -gt 0 ] && [ "$pll_locked" -ne 1 ]; then
 fi
 
 # Silent Audio Capture
-if [ -f "$audio_file" ] && [ "$(echo "$max_amplitude == 0.000000" | bc)" -eq 1 ]; then
+if [ -f "$audio_file" ] && [ "$max_amplitude" = "0.000000" ] || [ -z "$max_amplitude" ]; then
     log "ISSUE: SILENT AUDIO CAPTURE"
     log "  Possible causes:"
     log "  1. PLL not locked (see above)"
@@ -682,6 +836,62 @@ fi
 echo "    \"diagnosis_completed\": true,
     \"timestamp\": \"$(date +"%Y-%m%d_%H%M%S")\"
 }" >> "$JSON_FILE"
+
+# --- Minimal JSON summary for automation ---
+device_detected_bool=false
+i2c_status_str="not_detected"
+if echo "$i2c_scan" | grep -q "UU"; then
+    device_detected_bool=true
+    i2c_status_str="driver_owns_bus"
+elif echo "$i2c_scan" | grep -q " 3b"; then
+    device_detected_bool=true
+    i2c_status_str="responsive"
+fi
+
+alsa_card_present=false
+if echo "$alsa_devices_output" | grep -qi "seeed-4mic-voicecard\|seeed4micvoicec"; then
+    alsa_card_present=true
+fi
+
+dw_hwparams_err=$(dmesg | grep -m1 "designware-i2s .*hw_params.*-22" | tail -1)
+status_val="success"
+error_code_val=null
+root_cause_val="none"
+required_actions_json="[]"
+
+if [ -n "$dw_hwparams_err" ]; then
+    status_val="error"
+    error_code_val=-22
+    root_cause_val="designware-i2s hw_params rejected (likely channel/clock constraint on RP1)"
+    required_actions_json='["check arecord --dump-hw-params for RP1 constraints","limit channels or adjust slot/clock settings","review dmesg for designware-i2s hw_params errors"]'
+elif [ "$device_detected_bool" = false ]; then
+    status_val="error"
+    error_code_val=-6
+    root_cause_val="AC108 not detected on i2c bus"
+    required_actions_json='["verify I2C wiring and overlay","run i2cdetect -y 1 to confirm address 0x3b","reload snd_soc_ac108 module"]'
+fi
+
+hw_params_error_bool=false
+if [ -n "$dw_hwparams_err" ]; then
+    hw_params_error_bool=true
+fi
+
+cat > "$MIN_JSON_FILE" <<EOF
+{
+  "status": "$status_val",
+  "error_code": $error_code_val,
+  "key_metrics": {
+    "device_detected": $device_detected_bool,
+    "i2c_status": "$i2c_status_str",
+    "alsa_card_present": $alsa_card_present,
+    "hw_params_error": $hw_params_error_bool
+  },
+  "root_cause": "$root_cause_val",
+  "required_actions": $required_actions_json
+}
+EOF
+
+log "Minimal JSON file: $MIN_JSON_FILE"
 
 # --- End of Log ---
 log "=== END OF DIAGNOSTIC LOG ==="

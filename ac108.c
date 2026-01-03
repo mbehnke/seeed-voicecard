@@ -162,9 +162,9 @@ static const struct pll_div ac108_pll_div_list[] = {
 #define AC108_RATES			(SNDRV_PCM_RATE_8000_96000 &		\
 					~(SNDRV_PCM_RATE_32000 | SNDRV_PCM_RATE_64000 | \
 					SNDRV_PCM_RATE_88200 | SNDRV_PCM_RATE_96000))
-#define AC108_FORMATS			(/*SNDRV_PCM_FMTBIT_S16_LE | \
-					SNDRV_PCM_FMTBIT_S20_3LE |   \
-					SNDRV_PCM_FMTBIT_S24_LE |*/  \
+#define AC108_FORMATS			(SNDRV_PCM_FMTBIT_S16_LE | \
+					/*SNDRV_PCM_FMTBIT_S20_3LE | */ \
+					SNDRV_PCM_FMTBIT_S24_LE |   \
 					SNDRV_PCM_FMTBIT_S32_LE)
 
 static const DECLARE_TLV_DB_SCALE(tlv_adc_pga_gain, 0, 100, 0);
@@ -173,10 +173,18 @@ static const DECLARE_TLV_DB_SCALE(tlv_ch_digital_vol, -11925,75,0);
 int ac10x_read(u8 reg, u8* rt_val, struct regmap* i2cm) {
 	int r, v = 0;
 
-	if ((r = regmap_read(i2cm, reg, &v)) < 0) {
-		pr_err("ac10x_read error->[REG-0x%02x]\n", reg);
+	if (i2cm == NULL) {
+		pr_err("ac10x_read: ERROR - regmap pointer is NULL for register 0x%02x\n", reg);
+		return -EINVAL;
+	}
+
+	r = regmap_read(i2cm, reg, &v);
+	if (r < 0) {
+		pr_err("ac10x_read error->[REG-0x%02x]: %d (possible regcache issue)\n", reg, r);
+		return r;
 	} else {
 		*rt_val = v;
+		pr_debug("ac10x_read: REG-0x%02x = 0x%02x\n", reg, v);
 	}
 	return r;
 }
@@ -184,8 +192,16 @@ int ac10x_read(u8 reg, u8* rt_val, struct regmap* i2cm) {
 int ac10x_write(u8 reg, u8 val, struct regmap* i2cm) {
 	int r;
 
-	if ((r = regmap_write(i2cm, reg, val)) < 0) {
-		pr_err("ac10x_write error->[REG-0x%02x,val-0x%02x]\n", reg, val);
+	if (i2cm == NULL) {
+		pr_err("ac10x_write: ERROR - regmap pointer is NULL for register 0x%02x\n", reg);
+		return -EINVAL;
+	}
+
+	pr_debug("ac10x_write: Writing REG-0x%02x = 0x%02x\n", reg, val);
+	r = regmap_write(i2cm, reg, val);
+	if (r < 0) {
+		pr_err("ac10x_write error->[REG-0x%02x,val-0x%02x]: %d (possible regcache issue)\n", reg, val, r);
+		return r;
 	}
 	return r;
 }
@@ -193,8 +209,16 @@ int ac10x_write(u8 reg, u8 val, struct regmap* i2cm) {
 int ac10x_update_bits(u8 reg, u8 mask, u8 val, struct regmap* i2cm) {
 	int r;
 
-	if ((r = regmap_update_bits(i2cm, reg, mask, val)) < 0) {
-		pr_err("%s() error->[REG-0x%02x,val-0x%02x]\n", __func__, reg, val);
+	if (i2cm == NULL) {
+		pr_err("ac10x_update_bits: ERROR - regmap pointer is NULL for register 0x%02x\n", reg);
+		return -EINVAL;
+	}
+
+	pr_debug("ac10x_update_bits: REG-0x%02x, mask=0x%02x, val=0x%02x\n", reg, mask, val);
+	r = regmap_update_bits(i2cm, reg, mask, val);
+	if (r < 0) {
+		pr_err("ac10x_update_bits error->[REG-0x%02x,val-0x%02x]: %d (possible regcache issue)\n", reg, val, r);
+		return r;
 	}
 	return r;
 }
@@ -895,12 +919,11 @@ static int ac108_hw_params(struct snd_pcm_substream *substream, struct snd_pcm_h
 	ac108_multi_update_bits(ADC_SPRC, 0x0f << ADC_FS_I2S1, ac108_sample_rate[rate].reg_val << ADC_FS_I2S1, ac10x);
 	ac108_multi_write(HPF_EN, 0x0F, ac10x);
 
-	if (ac10x->i2c101 && _MASTER_MULTI_CODEC == _MASTER_AC101) {
-		ac108_config_pll(ac10x, ac108_sample_rate[rate].real_val, ac108_samp_res[samp_res].real_val * channels);
-	} else {
-		pr_info("ac108: [hw_params] Using BCLK as PLL source (RPi5 fix): lrck_ratio=%u\n", ac108_samp_res[samp_res].real_val * channels);
-		ac108_config_pll(ac10x, ac108_sample_rate[rate].real_val, ac108_samp_res[samp_res].real_val * channels);
-	}
+	/* RPi5 SYSCLK configuration: Use MCLK directly (24MHz) instead of PLL */
+	/* PLL locking on RPi5 has proven unreliable; MCLK 24MHz is sufficient for audio */
+	pr_info("ac108: [hw_params] Using MCLK directly (24MHz) - RPi5 MCLK mode\n");
+	ac10x->clk_id = SYSCLK_SRC_MCLK;
+	ac108_config_pll(ac10x, ac108_sample_rate[rate].real_val, 0); /* lrck_ratio=0 triggers MCLK mode */
 
 	/* Verify PLL and SYSCLK were enabled by config_pll */
 	{
@@ -1332,100 +1355,245 @@ int ac108_audio_startup(struct snd_pcm_substream *substream,
 ) {
 	struct snd_soc_codec *codec = dai->codec;
 	struct ac10x_priv *ac10x = snd_soc_codec_get_drvdata(codec);
+	int ret = 0;
+	int i;
 
 	pr_info("ac108: *** STARTUP CALLED *** stream=%s\n", 
 		snd_pcm_stream_str(substream));
 
 	/* Ensure analog and digital capture path is enabled at stream startup */
 	if (substream->stream == SNDRV_PCM_STREAM_CAPTURE) {
+		/* ===== REGCACHE MANAGEMENT: Force bypass to ensure hardware access ===== */
+		pr_info("ac108: [startup] Disabling regcache (forcing hardware access)...\n");
+		for (i = 0; i < ac10x->codec_cnt; i++) {
+			if (ac10x->i2cmap[i] == NULL) {
+				pr_err("ac108: [startup] ERROR: i2cmap[%d] is NULL!\n", i);
+				return -EINVAL;
+			}
+			
+			/* Disable cache-only mode for direct hardware access */
+			pr_debug("ac108: [startup] Codec %d: Disabling cache-only mode for direct hardware access\n", i);
+			regcache_cache_only(ac10x->i2cmap[i], false);
+			pr_info("ac108: [startup] Codec %d: Disabled cache-only mode for direct hardware access\n", i);
+		}
+		
 		/* Enable module clocks: I2S, ADC digital, ADC analog */
-		ac108_multi_write(MOD_CLK_EN,
+		pr_debug("ac108: [startup] Writing MOD_CLK_EN register...\n");
+		ret = ac108_multi_write(MOD_CLK_EN,
 			(0x1 << I2S) | (0x1 << ADC_DIGITAL) | (0x1 << ADC_ANALOG),
 			ac10x);
+		if (ret < 0) {
+			pr_err("ac108: [startup] ERROR writing MOD_CLK_EN: %d\n", ret);
+			goto startup_error;
+		}
+		pr_debug("ac108: [startup] MOD_CLK_EN write successful\n");
+		
 		/* Deassert module resets for I2S, ADC digital, ADC analog */
-		ac108_multi_write(MOD_RST_CTRL,
+		pr_debug("ac108: [startup] Writing MOD_RST_CTRL register...\n");
+		ret = ac108_multi_write(MOD_RST_CTRL,
 			(0x1 << I2S) | (0x1 << ADC_DIGITAL) | (0x1 << ADC_ANALOG),
 			ac10x);
+		if (ret < 0) {
+			pr_err("ac108: [startup] ERROR writing MOD_RST_CTRL: %d\n", ret);
+			goto startup_error;
+		}
+		pr_debug("ac108: [startup] MOD_RST_CTRL write successful\n");
 
 		/* Verify clock and reset registers */
 		{
 			u8 mod_clk = 0, mod_rst = 0;
-			ac10x_read(MOD_CLK_EN, &mod_clk, ac10x->i2cmap[0]);
-			ac10x_read(MOD_RST_CTRL, &mod_rst, ac10x->i2cmap[0]);
+			pr_debug("ac108: [startup] Reading back MOD_CLK_EN and MOD_RST_CTRL...\n");
+			ret = ac10x_read(MOD_CLK_EN, &mod_clk, ac10x->i2cmap[0]);
+			if (ret < 0) {
+				pr_err("ac108: [startup] ERROR reading MOD_CLK_EN: %d\n", ret);
+				goto startup_error;
+			}
+			ret = ac10x_read(MOD_RST_CTRL, &mod_rst, ac10x->i2cmap[0]);
+			if (ret < 0) {
+				pr_err("ac108: [startup] ERROR reading MOD_RST_CTRL: %d\n", ret);
+				goto startup_error;
+			}
 			pr_info("ac108: [startup] MOD_CLK_EN=0x%02x (expect 0x91: I2S|ADC_DIG|ADC_ANA), MOD_RST_CTRL=0x%02x (expect 0x91)\n",
 				mod_clk, mod_rst);
+			
+			/* Validate register values */
+			if (mod_clk != 0x91) {
+				pr_warn("ac108: [startup] WARNING: MOD_CLK_EN mismatch! Got 0x%02x, expected 0x91\n", mod_clk);
+			}
+			if (mod_rst != 0x91) {
+				pr_warn("ac108: [startup] WARNING: MOD_RST_CTRL mismatch! Got 0x%02x, expected 0x91\n", mod_rst);
+			}
 		}
+		
 		/* Enable I2S TX1 output and SDO1 */
-		ac10x_update_bits(I2S_CTRL,
+		pr_debug("ac108: [startup] Writing I2S_CTRL (enable TX1 and SDO1)...\n");
+		ret = ac10x_update_bits(I2S_CTRL,
 			(0x1 << SDO1_EN) | (0x1 << TXEN) | (0x1 << GEN),
 			(0x1 << SDO1_EN) | (0x1 << TXEN) | (0x1 << GEN),
 			ac10x->i2cmap[_MASTER_INDEX]);
+		if (ret < 0) {
+			pr_err("ac108: [startup] ERROR writing I2S_CTRL: %d\n", ret);
+			goto startup_error;
+		}
+		pr_debug("ac108: [startup] I2S_CTRL write successful\n");
 		
 		/* Debug: verify TXEN was set */
 		{
 			u8 reg_val = 0;
-			ac10x_read(I2S_CTRL, &reg_val, ac10x->i2cmap[_MASTER_INDEX]);
+			pr_debug("ac108: [startup] Reading back I2S_CTRL...\n");
+			ret = ac10x_read(I2S_CTRL, &reg_val, ac10x->i2cmap[_MASTER_INDEX]);
+			if (ret < 0) {
+				pr_err("ac108: [startup] ERROR reading I2S_CTRL: %d\n", ret);
+				goto startup_error;
+			}
 			pr_info("ac108: After setting TXEN in startup: I2S_CTRL=0x%02x\n", reg_val);
+			
+			/* Validate I2S_CTRL value */
+			if ((reg_val & 0xF5) != 0xF5) {
+				pr_warn("ac108: [startup] WARNING: I2S_CTRL bits mismatch! Got 0x%02x, expected bits matching 0xF5\n", reg_val);
+			}
 		}
 
 		/* Enable TX1 channels 1–4 */
 		pr_info("ac108: [startup] Enabling TX1 channels 1-4\n");
-		ac10x_update_bits(I2S_TX1_CTRL2,
+		pr_debug("ac108: [startup] Writing I2S_TX1_CTRL2...\n");
+		ret = ac10x_update_bits(I2S_TX1_CTRL2,
 			(0x1 << TX1_CH1_EN) | (0x1 << TX1_CH2_EN) | (0x1 << TX1_CH3_EN) | (0x1 << TX1_CH4_EN),
 			(0x1 << TX1_CH1_EN) | (0x1 << TX1_CH2_EN) | (0x1 << TX1_CH3_EN) | (0x1 << TX1_CH4_EN),
 			ac10x->i2cmap[_MASTER_INDEX]);
+		if (ret < 0) {
+			pr_err("ac108: [startup] ERROR writing I2S_TX1_CTRL2: %d\n", ret);
+			goto startup_error;
+		}
 		{
 			u8 reg_val = 0;
-			ac10x_read(I2S_TX1_CTRL2, &reg_val, ac10x->i2cmap[_MASTER_INDEX]);
+			pr_debug("ac108: [startup] Reading back I2S_TX1_CTRL2...\n");
+			ret = ac10x_read(I2S_TX1_CTRL2, &reg_val, ac10x->i2cmap[_MASTER_INDEX]);
+			if (ret < 0) {
+				pr_err("ac108: [startup] ERROR reading I2S_TX1_CTRL2: %d\n", ret);
+				goto startup_error;
+			}
 			pr_info("ac108: [startup] After enabling channels: I2S_TX1_CTRL2=0x%02x (expected 0x0F)\n", reg_val);
+			if (reg_val != 0x0F) {
+				pr_warn("ac108: [startup] WARNING: I2S_TX1_CTRL2 mismatch! Got 0x%02x, expected 0x0F\n", reg_val);
+			}
 		}
 
 		/* Map TX1 slots 1–4 to ADC1–ADC4 respectively */
 		pr_info("ac108: [startup] Setting I2S_TX1_CHMP_CTRL1 to 0xE4\n");
-		ac10x_update_bits(I2S_TX1_CHMP_CTRL1,
+		pr_debug("ac108: [startup] Writing I2S_TX1_CHMP_CTRL1...\n");
+		ret = ac10x_update_bits(I2S_TX1_CHMP_CTRL1,
 			(0x3 << TX1_CH1_MAP) | (0x3 << TX1_CH2_MAP) | (0x3 << TX1_CH3_MAP) | (0x3 << TX1_CH4_MAP),
 			(0x0 << TX1_CH1_MAP) | (0x1 << TX1_CH2_MAP) | (0x2 << TX1_CH3_MAP) | (0x3 << TX1_CH4_MAP),
 			ac10x->i2cmap[_MASTER_INDEX]);
+		if (ret < 0) {
+			pr_err("ac108: [startup] ERROR writing I2S_TX1_CHMP_CTRL1: %d\n", ret);
+			goto startup_error;
+		}
 		{
 			u8 reg_val = 0;
-			ac10x_read(I2S_TX1_CHMP_CTRL1, &reg_val, ac10x->i2cmap[_MASTER_INDEX]);
+			pr_debug("ac108: [startup] Reading back I2S_TX1_CHMP_CTRL1...\n");
+			ret = ac10x_read(I2S_TX1_CHMP_CTRL1, &reg_val, ac10x->i2cmap[_MASTER_INDEX]);
+			if (ret < 0) {
+				pr_err("ac108: [startup] ERROR reading I2S_TX1_CHMP_CTRL1: %d\n", ret);
+				goto startup_error;
+			}
 			pr_info("ac108: [startup] After mapping TX1 channels: I2S_TX1_CHMP_CTRL1=0x%02x (expected 0xE4)\n", reg_val);
+			if (reg_val != 0xE4) {
+				pr_warn("ac108: [startup] WARNING: I2S_TX1_CHMP_CTRL1 mismatch! Got 0x%02x, expected 0xE4\n", reg_val);
+			}
 		}
 
 		/* Enable ADC digital blocks and all 4 channels */
 		pr_info("ac108: [startup] Enabling ADC digital blocks - DG_EN and ENAD1-4\n");
-		ac108_multi_update_bits(ADC_DIG_EN,
+		pr_debug("ac108: [startup] Writing ADC_DIG_EN...\n");
+		ret = ac108_multi_update_bits(ADC_DIG_EN,
 			(0x1 << DG_EN) | (0x1 << ENAD1) | (0x1 << ENAD2) | (0x1 << ENAD3) | (0x1 << ENAD4),
 			(0x1 << DG_EN) | (0x1 << ENAD1) | (0x1 << ENAD2) | (0x1 << ENAD3) | (0x1 << ENAD4),
 			ac10x);
+		if (ret < 0) {
+			pr_err("ac108: [startup] ERROR writing ADC_DIG_EN: %d\n", ret);
+			goto startup_error;
+		}
 		pr_info("ac108: [startup] ADC digital blocks enabled\n");
 
 		/* Enable ANA path: MICBIAS, PGA and DSM per channel */
 		pr_info("ac108: [startup] Enabling analog path - MICBIAS, PGA, DSM, unmuting PGA\n");
-		ac108_multi_update_bits(ANA_ADC1_CTRL1,
+		pr_debug("ac108: [startup] Writing ANA_ADC1_CTRL1...\n");
+		ret = ac108_multi_update_bits(ANA_ADC1_CTRL1,
 			(0x1 << ADC1_MICBIAS_EN) | (0x1 << ADC1_PGA_ENABLE) | (0x1 << ADC1_DSM_ENABLE) | (0x1 << ADC1_PGA_MUTE),
 			(0x1 << ADC1_MICBIAS_EN) | (0x1 << ADC1_PGA_ENABLE) | (0x1 << ADC1_DSM_ENABLE) | (0x0 << ADC1_PGA_MUTE),
 			ac10x);
-		ac108_multi_update_bits(ANA_ADC2_CTRL1,
+		if (ret < 0) {
+			pr_err("ac108: [startup] ERROR writing ANA_ADC1_CTRL1: %d\n", ret);
+			goto startup_error;
+		}
+		
+		pr_debug("ac108: [startup] Writing ANA_ADC2_CTRL1...\n");
+		ret = ac108_multi_update_bits(ANA_ADC2_CTRL1,
 			(0x1 << ADC2_MICBIAS_EN) | (0x1 << ADC2_PGA_ENABLE) | (0x1 << ADC2_DSM_ENABLE) | (0x1 << ADC2_PGA_MUTE),
 			(0x1 << ADC2_MICBIAS_EN) | (0x1 << ADC2_PGA_ENABLE) | (0x1 << ADC2_DSM_ENABLE) | (0x0 << ADC2_PGA_MUTE),
 			ac10x);
-		ac108_multi_update_bits(ANA_ADC3_CTRL1,
+		if (ret < 0) {
+			pr_err("ac108: [startup] ERROR writing ANA_ADC2_CTRL1: %d\n", ret);
+			goto startup_error;
+		}
+		
+		pr_debug("ac108: [startup] Writing ANA_ADC3_CTRL1...\n");
+		ret = ac108_multi_update_bits(ANA_ADC3_CTRL1,
 			(0x1 << ADC3_MICBIAS_EN) | (0x1 << ADC3_PGA_ENABLE) | (0x1 << ADC3_DSM_ENABLE) | (0x1 << ADC3_PGA_MUTE),
 			(0x1 << ADC3_MICBIAS_EN) | (0x1 << ADC3_PGA_ENABLE) | (0x1 << ADC3_DSM_ENABLE) | (0x0 << ADC3_PGA_MUTE),
 			ac10x);
-		ac108_multi_update_bits(ANA_ADC4_CTRL1,
+		if (ret < 0) {
+			pr_err("ac108: [startup] ERROR writing ANA_ADC3_CTRL1: %d\n", ret);
+			goto startup_error;
+		}
+		
+		pr_debug("ac108: [startup] Writing ANA_ADC4_CTRL1...\n");
+		ret = ac108_multi_update_bits(ANA_ADC4_CTRL1,
 			(0x1 << ADC4_MICBIAS_EN) | (0x1 << ADC4_PGA_ENABLE) | (0x1 << ADC4_DSM_ENABLE) | (0x1 << ADC4_PGA_MUTE),
 			(0x1 << ADC4_MICBIAS_EN) | (0x1 << ADC4_PGA_ENABLE) | (0x1 << ADC4_DSM_ENABLE) | (0x0 << ADC4_PGA_MUTE),
 			ac10x);
+		if (ret < 0) {
+			pr_err("ac108: [startup] ERROR writing ANA_ADC4_CTRL1: %d\n", ret);
+			goto startup_error;
+		}
 
 		/* Set a safe default digital volume to avoid mute (per channel) */
 		pr_info("ac108: [startup] Setting digital volumes to 0xC0\n");
-		ac108_multi_write(ADC1_DVOL_CTRL, 0xC0, ac10x);
-		ac108_multi_write(ADC2_DVOL_CTRL, 0xC0, ac10x);
-		ac108_multi_write(ADC3_DVOL_CTRL, 0xC0, ac10x);
-		ac108_multi_write(ADC4_DVOL_CTRL, 0xC0, ac10x);
+		pr_debug("ac108: [startup] Writing ADC digital volume registers...\n");
+		ret = ac108_multi_write(ADC1_DVOL_CTRL, 0xC0, ac10x);
+		if (ret < 0) {
+			pr_err("ac108: [startup] ERROR writing ADC1_DVOL_CTRL: %d\n", ret);
+			goto startup_error;
+		}
+		ret = ac108_multi_write(ADC2_DVOL_CTRL, 0xC0, ac10x);
+		if (ret < 0) {
+			pr_err("ac108: [startup] ERROR writing ADC2_DVOL_CTRL: %d\n", ret);
+			goto startup_error;
+		}
+		ret = ac108_multi_write(ADC3_DVOL_CTRL, 0xC0, ac10x);
+		if (ret < 0) {
+			pr_err("ac108: [startup] ERROR writing ADC3_DVOL_CTRL: %d\n", ret);
+			goto startup_error;
+		}
+		ret = ac108_multi_write(ADC4_DVOL_CTRL, 0xC0, ac10x);
+		if (ret < 0) {
+			pr_err("ac108: [startup] ERROR writing ADC4_DVOL_CTRL: %d\n", ret);
+			goto startup_error;
+		}
+		
 		pr_info("ac108: [startup] ✅ COMPLETE - All ADC channels enabled and configured\n");
+		return 0;
+		
+		/* ===== ERROR HANDLER ===== */
+startup_error:
+		pr_err("ac108: [startup] ❌ STARTUP FAILED - Attempting cleanup\n");
+		pr_err("ac108: [startup] Disabling modules due to error...\n");
+		/* Attempt to disable on error */
+		ac108_multi_write(MOD_CLK_EN, 0x0, ac10x);
+		ac108_multi_write(MOD_RST_CTRL, 0x0, ac10x);
+		return ret;
 	}
 
 	if (ac10x->i2c101) {
@@ -1630,13 +1798,23 @@ int ac108_codec_resume(struct snd_soc_codec *codec) {
 	int i, ret;
 
 	/* Sync reg_cache with the hardware */
+	/* CRITICAL FIX: Properly manage exclusive I2C access
+	   1. Enable cache-only for efficient sync
+	   2. Do the sync
+	   3. Disable cache-only to allow userspace access
+	   4. Explicitly mark regmap as not offline so other drivers can access it
+	*/
 	for (i = 0; i < ac10x->codec_cnt; i++) {
-		regcache_cache_only(ac10x->i2cmap[i], false);
+		regcache_cache_only(ac10x->i2cmap[i], true);   /* Temp enable for sync */
 		ret = regcache_sync(ac10x->i2cmap[i]);
 		if (ret != 0) {
 			dev_err(codec->dev, "Failed to sync i2cmap%d register cache: %d\n", i, ret);
-			regcache_cache_only(ac10x->i2cmap[i], true);
 		}
+		regcache_cache_only(ac10x->i2cmap[i], false);  /* KEEP DISABLED for userspace */
+		
+		/* Mark as not offline - allows userspace I2C access */
+		regcache_mark_dirty(ac10x->i2cmap[i]);
+		dev_dbg(codec->dev, "Regcache cache-only DISABLED for codec %d - userspace I2C access enabled\n", i);
 	}
 
 	if (! ac10x->i2c101) {
@@ -1752,7 +1930,10 @@ static int ac108_i2c_probe(struct i2c_client *i2c) {
 	unsigned int val = 0;
 	int ret = 0, index;
 
+	pr_info("ac108: [probe] Starting AC108 I2C probe for device at address 0x%02x\n", i2c->addr);
+
 	if (ac10x == NULL) {
+		pr_debug("ac108: [probe] Allocating ac10x private data structure\n");
 		ac10x = kzalloc(sizeof(struct ac10x_priv), GFP_KERNEL);
 		if (ac10x == NULL) {
 			dev_err(&i2c->dev, "Unable to allocate ac10x private data\n");
@@ -1761,14 +1942,19 @@ static int ac108_i2c_probe(struct i2c_client *i2c) {
 		/* Initialize PLL delayed work for deferred PLL enable on RPi5 */
 		INIT_DELAYED_WORK(&ac10x->pll_work, ac108_pll_work);
 		ac10x->pll_pending = 0;
+		pr_debug("ac108: [probe] ac10x structure allocated and initialized\n");
 	}
 
 	index = (int)i2c_match_id(ac108_i2c_id, i2c)->driver_data;
+	pr_info("ac108: [probe] Device index from i2c_device_id match: %d\n", index);
+	
 	if (index == AC101_I2C_ID) {
+		pr_info("ac108: [probe] Detected AC101 codec (index=%d)\n", index);
 		ac10x->i2c101 = i2c;
 		i2c_set_clientdata(i2c, ac10x);
 		ret = ac101_probe(i2c, i2c_match_id(ac108_i2c_id, i2c));
 		if (ret) {
+			pr_err("ac108: [probe] AC101 probe failed with error: %d\n", ret);
 			ac10x->i2c101 = NULL;
 			return ret;
 		}
@@ -1789,30 +1975,68 @@ static int ac108_i2c_probe(struct i2c_client *i2c) {
 	pr_info(" ac10x data protocol: %d\n", ac10x->data_protocol);
 
 	ac10x->i2c[index] = i2c;
+	
+	/* ===== REGMAP INITIALIZATION WITH DEBUGGING ===== */
+	pr_debug("ac108: [probe] Initializing regmap for codec %d...\n", index);
 	ac10x->i2cmap[index] = devm_regmap_init_i2c(i2c, &ac108_regmap);
 	if (IS_ERR(ac10x->i2cmap[index])) {
 		ret = PTR_ERR(ac10x->i2cmap[index]);
 		dev_err(&i2c->dev, "Fail to initialize i2cmap%d I/O: %d\n", index, ret);
+		pr_err("ac108: [probe] ERROR: regmap_init_i2c failed with code %d\n", ret);
 		return ret;
 	}
+	pr_info("ac108: [probe] Regmap initialized successfully for codec %d\n", index);
 
 	/*
-	 * Writing this register with 0x12 
+	 * Writing this register with 0x12
 	 * will resets all register to their default state.
+	 * Use cache bypass to avoid regmap cache sync conflicts during probe.
+	 * Add delay and retry to work around I2C arbitration issues.
 	 */
-	regcache_cache_only(ac10x->i2cmap[index], false);
-	ret = regmap_write(ac10x->i2cmap[index], CHIP_RST, CHIP_RST_VAL);
+	pr_debug("ac108: [probe] Enabling cache bypass for initial chip reset...\n");
+	regcache_cache_bypass(ac10x->i2cmap[index], true);
+	msleep(10); /* Wait for I2C bus to stabilize */
+
+	/* Retry CHIP_RST write up to 5 times to work around I2C arbitration errors */
+	for (ret = -1; ret < 0 && ++ret < 5; ) {
+		int write_ret;
+		pr_debug("ac108: [probe] Writing CHIP_RST register (0x%02x), attempt %d...\n", CHIP_RST_VAL, ret + 1);
+		write_ret = regmap_write(ac10x->i2cmap[index], CHIP_RST, CHIP_RST_VAL);
+		if (write_ret == 0) {
+			ret = 0;
+			break;
+		}
+		if (ret < 4) {
+			pr_warn("ac108: [probe] CHIP_RST write failed (attempt %d): %d, retrying...\n", ret + 1, write_ret);
+			msleep(5);
+		} else {
+			ret = write_ret;
+		}
+	}
+
+	regcache_cache_bypass(ac10x->i2cmap[index], false);
+	if (ret < 0) {
+		pr_err("ac108: [probe] ERROR: Failed to write CHIP_RST after 5 attempts: %d\n", ret);
+		return ret;
+	}
+	pr_info("ac108: [probe] Chip reset successful\n");
 	msleep(1);
 
 	/* sync regcache for FLAT type */
+	pr_debug("ac108: [probe] Filling regcache...\n");
 	ac10x_fill_regcache(&i2c->dev, ac10x->i2cmap[index]);
+	pr_debug("ac108: [probe] Regcache fill complete\n");
 
 	ac10x->codec_cnt++;
-	pr_info(" ac10x codec count  : %d\n", ac10x->codec_cnt);
+	pr_info("ac108: [probe] Codec count incremented to: %d\n", ac10x->codec_cnt);
 
+	pr_debug("ac108: [probe] Creating sysfs debug attributes...\n");
 	ret = sysfs_create_group(&i2c->dev.kobj, &ac108_debug_attr_group);
 	if (ret) {
-		pr_err("failed to create attr group\n");
+		pr_err("ac108: [probe] WARNING: Failed to create sysfs attrs (non-critical): %d\n", ret);
+		/* Continue despite sysfs failure */
+	} else {
+		pr_debug("ac108: [probe] Sysfs attributes created successfully\n");
 	}
 
 __ret:

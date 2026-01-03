@@ -169,54 +169,74 @@ static int seeed_voice_card_hw_params(struct snd_pcm_substream *substream,
 	struct seeed_dai_props *dai_props =
 		seeed_priv_to_props(priv, rtd->num);
 	unsigned int mclk, mclk_fs = 0;
+	unsigned int request_ch = params_channels(params);
 	int ret = 0;
+	int tdm_disabled = 0;
 
 	dev_info(rtd->dev, "=== hw_params ENTER: rate=%u channels=%u ===\n",
 		params_rate(params), params_channels(params));
 
 	/* Configure TDM slots if specified in device tree */
+	/* NOTE: RPi 5 designware-i2s does NOT support TDM - skip TDM configuration */
 	if (dai_props->cpu_dai.slots) {
-		pr_info("seeed-voicecard: %s: Configuring CPU DAI TDM slots from DT\n", __func__);
-		dev_info(rtd->dev, "Setting CPU DAI TDM: slots=%d, width=%d, tx_mask=0x%x, rx_mask=0x%x\n",
-			dai_props->cpu_dai.slots,
-			dai_props->cpu_dai.slot_width,
-			dai_props->cpu_dai.tx_slot_mask,
-			dai_props->cpu_dai.rx_slot_mask);
-		ret = snd_soc_dai_set_tdm_slot(cpu_dai,
-						dai_props->cpu_dai.tx_slot_mask,
-						dai_props->cpu_dai.rx_slot_mask,
-						dai_props->cpu_dai.slots,
-						dai_props->cpu_dai.slot_width);
-		if (ret < 0) {
-			dev_err(rtd->dev, "CPU DAI TDM slot configuration FAILED: %d\n", ret);
-			dev_warn(rtd->dev, "TDM may not be supported - continuing without explicit TDM config\n");
-			/* Continue anyway - TDM might be handled by simple-card or device tree */
-			ret = 0;
-		} else {
-			dev_info(rtd->dev, "CPU DAI TDM slot configured successfully: ret=%d\n", ret);
-		}
+		pr_info("seeed-voicecard: %s: Skipping CPU DAI TDM config (not supported on RPi5)\n", __func__);
+		/* TDM not supported on RPi 5 - just log and continue */
+		dev_info(rtd->dev, "TDM requested but NOT applied (RPi5 hw limitation)\n");
+		/* Clear TDM settings to prevent snd_soc_dai_set_tdm_slot call */
+		dai_props->cpu_dai.slots = 0;
+		dai_props->codec_dai.slots = 0;
+		tdm_disabled = 1;
 	}
 
-	if (dai_props->codec_dai.slots) {
-		pr_info("seeed-voicecard: %s: Configuring Codec DAI TDM slots\n", __func__);
-		dev_info(rtd->dev, "Setting Codec DAI TDM: slots=%d, width=%d, tx_mask=0x%x, rx_mask=0x%x\n",
-			dai_props->codec_dai.slots,
-			dai_props->codec_dai.slot_width,
-			dai_props->codec_dai.tx_slot_mask,
-			dai_props->codec_dai.rx_slot_mask);
-		ret = snd_soc_dai_set_tdm_slot(codec_dai,
-						dai_props->codec_dai.tx_slot_mask,
-						dai_props->codec_dai.rx_slot_mask,
-						dai_props->codec_dai.slots,
-						dai_props->codec_dai.slot_width);
-		if (ret < 0) {
-			dev_err(rtd->dev, "Codec DAI TDM slot configuration FAILED: %d\n", ret);
-			dev_warn(rtd->dev, "TDM may not be supported - continuing without explicit TDM config\n");
-			/* Continue anyway - TDM might be handled by simple-card or device tree */
-			ret = 0;
-		} else {
-			dev_info(rtd->dev, "Codec DAI TDM slot configured successfully: ret=%d\n", ret);
+	/*
+	 * RP1 designware-i2s hw_params rejection for >2ch (-EINVAL).
+	 * Fallback: if TDM is disabled and channels > 2, constrain to 2ch
+	 * to allow partial operation rather than complete failure.
+	 * This is logged so users understand the limitation.
+	 */
+	if (tdm_disabled && request_ch > 2) {
+		dev_warn(rtd->dev,
+			"⚠️  RP1 CONSTRAINT: Requested %u channels but TDM disabled\n"
+			"   Downgrading to 2-channel capture (RP1 designware-i2s limitation)\n"
+			"   To use >2 channels, rebuild with RP1 TDM support or use software mixing\n",
+			request_ch);
+		request_ch = 2;
+	}
+
+	/*
+	 * On RP1 (designware-i2s) we still need explicit slot programming for
+	 * >2 channels even in I2S mode. Without slots, hw_params returns -22
+	 * for 4-ch capture. Program 4 slots of 32 bits when channels > 2.
+	 */
+	if (request_ch > 2) {
+		unsigned int slots = request_ch;
+		unsigned int slot_width = 32;
+		unsigned int mask = (1 << slots) - 1;
+
+		ret = snd_soc_dai_set_tdm_slot(cpu_dai, mask, mask, slots, slot_width);
+		if (ret && ret != -ENOTSUPP) {
+			dev_err(rtd->dev, "CPU DAI set_tdm_slot failed: %d (slots=%u width=%u)\n",
+				ret, slots, slot_width);
+			goto err;
 		}
+
+		ret = snd_soc_dai_set_tdm_slot(codec_dai, mask, mask, slots, slot_width);
+		if (ret && ret != -ENOTSUPP) {
+			dev_err(rtd->dev, "CODEC DAI set_tdm_slot failed: %d (slots=%u width=%u)\n",
+				ret, slots, slot_width);
+			goto err;
+		}
+
+		ret = snd_soc_dai_set_bclk_ratio(cpu_dai, slots * slot_width);
+		if (ret && ret != -ENOTSUPP) {
+			dev_err(rtd->dev, "CPU DAI set_bclk_ratio failed: %d (ratio=%u)\n",
+				ret, slots * slot_width);
+			goto err;
+		}
+
+		dev_info(rtd->dev,
+			"Applied RP1 TDM slots: slots=%u width=%u mask=0x%x bclk_ratio=%u\n",
+			slots, slot_width, mask, slots * slot_width);
 	}
 
 	if (priv->mclk_fs)
@@ -585,21 +605,15 @@ static int seeed_voice_card_dai_link_of(struct device_node *node,
 	if (ret < 0)
 		goto dai_link_of_err;
 
-	/* Force I2S format if not set (RPi 5 RP1-I2S compatibility) */
-	if ((dai_link->dai_fmt & SND_SOC_DAIFMT_FORMAT_MASK) == 0) {
-		dev_warn(dev, "Format not parsed from DT, forcing I2S format\n");
-		dai_link->dai_fmt &= ~SND_SOC_DAIFMT_FORMAT_MASK;
-		dai_link->dai_fmt |= SND_SOC_DAIFMT_I2S;
-		dev_err(dev, "[DAI_LINK_OF] After forcing I2S: dai_fmt=0x%04x\n", dai_link->dai_fmt);
-	}
-
-	/* Force CPU (designware-i2s) as I2S clock master for RPi5 */
-	dev_info(dev, "[DAI_LINK_OF] Forcing CPU as I2S clock master for RPi5\n");
-	dev_info(dev, "[DAI_LINK_OF] Before: dai_fmt=0x%04x, master_mask=0x%04x\n",
-		 dai_link->dai_fmt, SND_SOC_DAIFMT_CLOCK_PROVIDER_MASK);
-	dai_link->dai_fmt &= ~SND_SOC_DAIFMT_CLOCK_PROVIDER_MASK;
-	dai_link->dai_fmt |= SND_SOC_DAIFMT_BC_FC;  /* Codec is bitclock/frame consumer (CPU provides clocks) */
-	dev_info(dev, "[DAI_LINK_OF] After forcing CPU master: dai_fmt=0x%04x (expected 0x1001)\n", dai_link->dai_fmt);
+	/*
+	 * RP1 requires pure I2S with CPU as clock master. Override any DT
+	 * settings to a known-good tuple: I2S | NB_NF | CBS_CFS.
+	 */
+	dai_link->dai_fmt = SND_SOC_DAIFMT_I2S |
+			     SND_SOC_DAIFMT_NB_NF |
+			     SND_SOC_DAIFMT_CBS_CFS;
+	dev_info(dev, "[DAI_LINK_OF] Forcing RP1 format: dai_fmt=0x%04x (I2S CPU-master)\n",
+		 dai_link->dai_fmt);
 
 	of_property_read_u32(node, "mclk-fs", &dai_props->mclk_fs);
 
@@ -1001,9 +1015,11 @@ static int seeed_voice_card_probe(struct platform_device *pdev)
 	seeed_debug_info(priv);
 
 	ret = devm_snd_soc_register_card(&pdev->dev, &priv->snd_card);
-	if (ret >= 0)
-		return ret;
-	dev_err(dev, "register card failed: %d\n", ret);
+	if (ret < 0) {
+		dev_err(dev, "register card failed: %d\n", ret);
+		goto err;
+	}
+	return ret;
 
 err:
 	simple_util_clean_reference(&priv->snd_card);

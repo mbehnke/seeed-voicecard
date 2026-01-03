@@ -14,6 +14,8 @@
 		__overlay__ {
 			dai-tdm-slot-num = <4>;
 			dai-tdm-slot-width = <32>;
+			/* Enable RX on slots 0-3 for 4-channel capture */
+			dai-tdm-slot-rx-mask = <0x0F>;
 		};
 	};
 };
