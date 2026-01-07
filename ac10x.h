@@ -64,6 +64,8 @@ struct ac10x_priv {
 	struct delayed_work dlywork;
 	int tdm_chips_cnt;
 	int sysclk_en;
+	struct delayed_work pll_work;	/* delayed work for PLL lock */
+	int pll_pending;		/* flag: PLL enable is pending */
 
 	/* member for ac101 .begin */
 	struct snd_soc_codec *codec;

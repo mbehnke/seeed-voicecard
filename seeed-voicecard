@@ -27,6 +27,11 @@ export PATH=$PATH:/opt/vc/bin
 OVERLAYS=/boot/overlays
 [ -d /boot/firmware/overlays ] && OVERLAYS=/boot/firmware/overlays
 
+IS_PI5=0
+if grep -q "bcm2712" /proc/cpuinfo; then
+    IS_PI5=1
+fi
+
 #enable i2c interface
 dtparam -d $OVERLAYS i2c_arm=on
 modprobe i2c-dev
@@ -93,7 +98,7 @@ is_1a=$(i2cdetect -y  1 0x1a 0x1a | egrep "(1a|UU)" | awk '{print $2}')
 is_35=$(i2cdetect -y  1 0x35 0x35 | egrep "(35|UU)" | awk '{print $2}')
 is_3b=$(i2cdetect -y  1 0x3b 0x3b | egrep "(3b|UU)" | awk '{print $2}')
 
-RPI_HATS="seeed-2mic-voicecard seeed-4mic-voicecard seeed-8mic-voicecard"
+RPI_HATS="seeed-2mic-voicecard seeed-4mic-voicecard seeed-4mic-voicecard-rpi5 seeed-8mic-voicecard"
 overlay=""
 
 if [ "x${is_1a}" != "x" ] && [ "x${is_35}" == "x" ] ; then
@@ -108,6 +113,10 @@ if [ "x${is_3b}" != "x" ] && [ "x${is_35}" == "x" ] ; then
     overlay=seeed-4mic-voicecard
     asound_conf=/etc/voicecard/asound_4mic.conf
     asound_state=/etc/voicecard/ac108_asound.state
+fi
+
+if [ $IS_PI5 -eq 1 ] && [ "x$overlay" = "xseeed-4mic-voicecard" ]; then
+    overlay=seeed-4mic-voicecard-rpi5
 fi
 
 if [ "x${is_3b}" != "x" ] && [ "x${is_35}" != "x" ] ; then
@@ -139,8 +148,14 @@ if [ "$overlay" ]; then
             fi
         done
     fi
-    #make sure the driver loads correctly
-    dtoverlay -d $OVERLAYS $overlay || true
+    # Pi 5: avoid runtime overlay application (can fail/conflict); rely on
+    # config.txt / merged DTB.
+    if [ $IS_PI5 -eq 1 ]; then
+        echo "Pi 5 detected: skipping runtime dtoverlay ($overlay)"
+    else
+        #make sure the driver loads correctly
+        dtoverlay -d $OVERLAYS $overlay || true
+    fi
 
 
     echo "create $overlay asound configure file"

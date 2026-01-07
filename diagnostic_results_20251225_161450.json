@@ -1,0 +1,48 @@
+{
+  "timestamp": "2025-12-25T16:14:50+01:00",
+  "kernel_version": "6.12.47+rpt-rpi-2712",
+  "tests": {
+    "i2c_detection": {
+      "status": "FAIL",
+      "details": "No device at 0x3b"
+    },
+    "kernel_modules": {
+      "status": "PASS",
+      "details": "All required modules loaded"
+    },
+    "alsa_card": {
+      "status": "PASS",
+      "details": "Card 0 registered"
+    },
+    "channel_mapping": {
+      "status": "PASS",
+      "details": "0x3C = 0xE4 (correct)"
+    },
+    "dai_format": {
+      "status": "PASS",
+      "details": "0x4001 - AC108 master"
+    },
+    "audio_recording": {
+      "status": "FAIL",
+      "details": "arecord error"
+    },
+    "device_tree": {
+      "status": "PASS",
+      "details": "DT nodes present"
+    },
+    "i2s_interface": {
+      "status": "FAIL",
+      "details": "Errors in dmesg"
+    }
+  },
+  "critical_findings": [
+    "AC108 not detected on I2C bus"
+  ],
+  "fixes_applied": [
+    "ac108.c:630 - Channel mapping corrected to 0xE4",
+    "seeed-voicecard.c - Keep AC108 as clock master for RPi5"
+  ],
+  "status": "ERRORS",
+  "max_amplitude": "0.0",
+  "rms_amplitude": "0.0"
+}

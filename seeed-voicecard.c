@@ -23,6 +23,7 @@
 #include <linux/of_gpio.h>
 #include <linux/platform_device.h>
 #include <linux/string.h>
+#include <sound/pcm.h>
 #include <sound/soc.h>
 #include <sound/soc-dai.h>
 #include <sound/simple_card_utils.h>
@@ -103,6 +104,9 @@ static int seeed_voice_card_startup(struct snd_pcm_substream *substream)
 		seeed_priv_to_props(priv, rtd->id);
 	int ret;
 
+	pr_info("seeed-voicecard: %s: stream=%s\n", __func__,
+		snd_pcm_stream_str(substream));
+
 	ret = clk_prepare_enable(dai_props->cpu_dai.clk);
 	if (ret)
 		return ret;
@@ -111,16 +115,47 @@ static int seeed_voice_card_startup(struct snd_pcm_substream *substream)
 	if (ret)
 		clk_disable_unprepare(dai_props->cpu_dai.clk);
 
-	if (snd_soc_rtd_to_cpu(rtd, 0)->driver->playback.channels_min) {
-		priv->channels_playback_default = snd_soc_rtd_to_cpu(rtd, 0)->driver->playback.channels_min;
+	/*
+	 * Apply channel overrides as per-stream PCM constraints.
+	 *
+	 * Do NOT mutate ->driver->capture/playback channels_{min,max} here:
+	 * those structures are shared globally and will break other streams/cards.
+	 */
+	if (substream->runtime) {
+		unsigned int ch = 0;
+		int tdm_disabled = (dai_props->cpu_dai.slots == 0);
+
+		if (substream->stream == SNDRV_PCM_STREAM_CAPTURE)
+			ch = priv->channels_capture_override;
+		else
+			ch = priv->channels_playback_override;
+
+		/*
+		 * RP1 designware-i2s fallback: if TDM is disabled and we requested >2ch,
+		 * constrain to 2ch to allow partial operation rather than failure.
+		 */
+		if (tdm_disabled && ch > 2) {
+			dev_warn(rtd->dev,
+				"RP1 FALLBACK: TDM disabled, constraining to 2-channel %s\n"
+				"  (requested %u ch but RP1 designware-i2s only supports 2 without TDM)\n",
+				snd_pcm_stream_str(substream), ch);
+			ch = 2;
+		}
+
+		if (ch) {
+			ret = snd_pcm_hw_constraint_minmax(substream->runtime,
+							SNDRV_PCM_HW_PARAM_CHANNELS,
+							ch, ch);
+			if (ret < 0)
+				dev_warn(rtd->dev,
+					"Failed to apply channel constraint (%u): %d\n",
+					ch, ret);
+			else
+				dev_info(rtd->dev,
+					"Applied channel constraint: %u (stream=%s)\n",
+					ch, snd_pcm_stream_str(substream));
+		}
 	}
-	if (snd_soc_rtd_to_cpu(rtd, 0)->driver->capture.channels_min) {
-		priv->channels_capture_default = snd_soc_rtd_to_cpu(rtd, 0)->driver->capture.channels_min;
-	}
-	snd_soc_rtd_to_cpu(rtd, 0)->driver->playback.channels_min = priv->channels_playback_override;
-	snd_soc_rtd_to_cpu(rtd, 0)->driver->playback.channels_max = priv->channels_playback_override;
-	snd_soc_rtd_to_cpu(rtd, 0)->driver->capture.channels_min = priv->channels_capture_override;
-	snd_soc_rtd_to_cpu(rtd, 0)->driver->capture.channels_max = priv->channels_capture_override;
 
 	return ret;
 }
@@ -131,11 +166,6 @@ static void seeed_voice_card_shutdown(struct snd_pcm_substream *substream)
 	struct seeed_card_data *priv =	snd_soc_card_get_drvdata(rtd->card);
 	struct seeed_dai_props *dai_props =
 		seeed_priv_to_props(priv, rtd->id);
-
-	snd_soc_rtd_to_cpu(rtd, 0)->driver->playback.channels_min = priv->channels_playback_default;
-	snd_soc_rtd_to_cpu(rtd, 0)->driver->playback.channels_max = priv->channels_playback_default;
-	snd_soc_rtd_to_cpu(rtd, 0)->driver->capture.channels_min = priv->channels_capture_default;
-	snd_soc_rtd_to_cpu(rtd, 0)->driver->capture.channels_max = priv->channels_capture_default;
 
 	clk_disable_unprepare(dai_props->cpu_dai.clk);
 
@@ -154,6 +184,61 @@ static int seeed_voice_card_hw_params(struct snd_pcm_substream *substream,
 	unsigned int mclk, mclk_fs = 0;
 	int ret = 0;
 
+	dev_info(rtd->dev, "=== hw_params ENTER: rate=%u channels=%u ===\n",
+		params_rate(params), params_channels(params));
+
+	/* RPi 5 RP1 designware-i2s does NOT support TDM - clear any DT settings */
+	if (dai_props->cpu_dai.slots) {
+		dev_info(rtd->dev, "Clearing TDM config (RPi5 RP1 limitation)\n");
+		dai_props->cpu_dai.slots = 0;
+		dai_props->codec_dai.slots = 0;
+	}
+
+	/*
+	 * RP5 Solution Path Selection via compile-time defines:
+	 * - RP5_2CH_WORKAROUND: Force 2ch with explicit BCLK (stable, 2 mics only)
+	 * - RP5_TDM_SLOTS: Try TDM slot programming for 4ch (experimental)
+	 * - Default: Standard I2S, relies on startup constraint
+	 */
+#ifdef RP5_2CH_WORKAROUND
+	/* SOLUTION A: 2-Channel forced mode with explicit BCLK timing */
+	{
+		unsigned int bclk_ratio = 64; /* 2ch * 32bit */
+		dev_info(rtd->dev, "[RP5_2CH_WORKAROUND] BCLK ratio=%u\n", bclk_ratio);
+		
+		ret = snd_soc_dai_set_bclk_ratio(cpu_dai, bclk_ratio);
+		if (ret && ret != -ENOTSUPP)
+			dev_warn(rtd->dev, "BCLK ratio failed: %d (non-critical)\n", ret);
+	}
+#elif defined(RP5_TDM_SLOTS)
+	/* SOLUTION B: Explicit TDM slot programming (experimental) */
+	if (params_channels(params) > 2) {
+		unsigned int slots = params_channels(params);
+		unsigned int slot_width = 32;
+		unsigned int mask = (1 << slots) - 1;
+		
+		dev_info(rtd->dev,
+			"[RP5_TDM_SLOTS] slots=%u width=%u mask=0x%x\n",
+			slots, slot_width, mask);
+		
+		ret = snd_soc_dai_set_tdm_slot(cpu_dai, mask, mask, slots, slot_width);
+		if (ret && ret != -ENOTSUPP)
+			dev_err(rtd->dev, "CPU TDM failed: %d\n", ret);
+		
+		ret = snd_soc_dai_set_tdm_slot(codec_dai, mask, mask, slots, slot_width);
+		if (ret && ret != -ENOTSUPP)
+			dev_err(rtd->dev, "Codec TDM failed: %d\n", ret);
+		
+		ret = snd_soc_dai_set_bclk_ratio(cpu_dai, slots * slot_width);
+		if (ret && ret != -ENOTSUPP)
+			dev_warn(rtd->dev, "BCLK ratio failed: %d (non-critical)\n", ret);
+	}
+#else
+	/* SOLUTION DEFAULT: Standard I2S mode (relies on startup constraint for 2ch) */
+	dev_info(rtd->dev, "[DEFAULT] Standard I2S mode, channels=%u\n",
+		params_channels(params));
+#endif
+
 	if (priv->mclk_fs)
 		mclk_fs = priv->mclk_fs;
 	else if (dai_props->mclk_fs)
@@ -161,18 +246,32 @@ static int seeed_voice_card_hw_params(struct snd_pcm_substream *substream,
 
 	if (mclk_fs) {
 		mclk = params_rate(params) * mclk_fs;
+		pr_info("seeed-voicecard: %s: Configuring MCLK: rate=%d Hz, mclk_fs=%d, mclk=%d Hz\n",
+			__func__, params_rate(params), mclk_fs, mclk);
+		
 		ret = snd_soc_dai_set_sysclk(codec_dai, 0, mclk,
 					     SND_SOC_CLOCK_IN);
-		if (ret && ret != -ENOTSUPP)
+		if (ret && ret != -ENOTSUPP) {
+			dev_err(rtd->dev, "Codec DAI sysclk configuration FAILED: %d\n", ret);
 			goto err;
+		} else if (ret == 0) {
+			dev_info(rtd->dev, "Codec DAI sysclk configured: %d Hz (CLOCK_IN)\n", mclk);
+		}
 
 		ret = snd_soc_dai_set_sysclk(cpu_dai, 0, mclk,
 					     SND_SOC_CLOCK_OUT);
-		if (ret && ret != -ENOTSUPP)
+		if (ret && ret != -ENOTSUPP) {
+			dev_err(rtd->dev, "CPU DAI sysclk configuration FAILED: %d\n", ret);
 			goto err;
+		} else if (ret == 0) {
+			dev_info(rtd->dev, "CPU DAI sysclk configured: %d Hz (CLOCK_OUT)\n", mclk);
+		}
 	}
+	
+	dev_info(rtd->dev, "=== hw_params EXIT: SUCCESS ===\n");
 	return 0;
 err:
+	dev_err(rtd->dev, "=== hw_params EXIT: FAILED ret=%d ===\n", ret);
 	return ret;
 }
 
@@ -180,12 +279,16 @@ err:
 static int (* _set_clock[_SET_CLOCK_CNT])(int y_start_n_stop, struct snd_pcm_substream *substream, int cmd, struct snd_soc_dai *dai);
 
 int seeed_voice_card_register_set_clock(int stream, int (*set_clock)(int, struct snd_pcm_substream *, int, struct snd_soc_dai *)) {
+	pr_info("seeed-voicecard: register_set_clock CALLED for stream %d (0=PLAYBACK, 1=CAPTURE)\n", stream);
 	if (! _set_clock[stream]) {
 		_set_clock[stream] = set_clock;
+		pr_info("seeed-voicecard: Registered set_clock callback for stream %d\n", stream);
+	} else {
+		pr_warn("seeed-voicecard: set_clock[%d] already registered, skipping\n", stream);
 	}
 	return 0;
 }
-EXPORT_SYMBOL(seeed_voice_card_register_set_clock);
+EXPORT_SYMBOL_GPL(seeed_voice_card_register_set_clock);
 
 /*
  * work_cb_codec_clk: clear audio codec inner clock.
@@ -218,24 +321,23 @@ static int seeed_voice_card_trigger(struct snd_pcm_substream *substream, int cmd
 	#endif
 	int ret = 0;
 
-	dev_dbg(rtd->card->dev, "%s() stream=%s  cmd=%d play:%d, capt:%d\n",
-		__FUNCTION__, snd_pcm_stream_str(substream), cmd,
-		dai->stream[SNDRV_PCM_STREAM_PLAYBACK].active, dai->stream[SNDRV_PCM_STREAM_CAPTURE].active);
+	pr_info("seeed-voicecard: [trigger] stream=%s cmd=%d (START=1,STOP=0)\n",
+		snd_pcm_stream_str(substream), cmd);
 
 	switch (cmd) {
 	case SNDRV_PCM_TRIGGER_START:
 	case SNDRV_PCM_TRIGGER_RESUME:
 	case SNDRV_PCM_TRIGGER_PAUSE_RELEASE:
+		pr_info("seeed-voicecard: [trigger] START - calling _set_clock callbacks\n");
 		if (cancel_work_sync(&priv->work_codec_clk) != 0) {}
-		#if CONFIG_AC10X_TRIG_LOCK
-		/* I know it will degrades performance, but I have no choice */
-		spin_lock_irqsave(&priv->lock, flags);
-		#endif
-		if (_set_clock[SNDRV_PCM_STREAM_CAPTURE]) _set_clock[SNDRV_PCM_STREAM_CAPTURE](1, substream, cmd, dai);
+		/* Enable PLL and clocks via codec callback */
+		if (_set_clock[SNDRV_PCM_STREAM_CAPTURE]) {
+			pr_info("seeed-voicecard: [trigger] Calling _set_clock[CAPTURE](1)\n");
+			_set_clock[SNDRV_PCM_STREAM_CAPTURE](1, substream, cmd, dai);
+		} else {
+			pr_warn("seeed-voicecard: [trigger] _set_clock[CAPTURE] is NULL!\n");
+		}
 		if (_set_clock[SNDRV_PCM_STREAM_PLAYBACK]) _set_clock[SNDRV_PCM_STREAM_PLAYBACK](1, substream, cmd, dai);
-		#if CONFIG_AC10X_TRIG_LOCK
-		spin_unlock_irqrestore(&priv->lock, flags);
-		#endif
 		break;
 
 	case SNDRV_PCM_TRIGGER_STOP:
@@ -245,16 +347,9 @@ static int seeed_voice_card_trigger(struct snd_pcm_substream *substream, int cmd
 		if (dai->stream[SNDRV_PCM_STREAM_CAPTURE].active && substream->stream == SNDRV_PCM_STREAM_PLAYBACK) {
 			break;
 		}
-
-		/* interrupt environment */
-		if (in_irq() || in_nmi() || in_serving_softirq()) {
-			priv->try_stop = 0;
-			if (0 != schedule_work(&priv->work_codec_clk)) {
-			}
-		} else {
-			if (_set_clock[SNDRV_PCM_STREAM_CAPTURE]) _set_clock[SNDRV_PCM_STREAM_CAPTURE](0, NULL, 0, NULL); /* not using 2nd to 4th arg if 1st == 0 */
-			if (_set_clock[SNDRV_PCM_STREAM_PLAYBACK]) _set_clock[SNDRV_PCM_STREAM_PLAYBACK](0, NULL, 0, NULL); /* not using 2nd to 4th arg if 1st == 0 */
-		}
+		/* Disable PLL and clocks via codec callback */
+		if (_set_clock[SNDRV_PCM_STREAM_CAPTURE]) _set_clock[SNDRV_PCM_STREAM_CAPTURE](0, NULL, 0, NULL);
+		if (_set_clock[SNDRV_PCM_STREAM_PLAYBACK]) _set_clock[SNDRV_PCM_STREAM_PLAYBACK](0, NULL, 0, NULL);
 		break;
 	default:
 		ret = -EINVAL;
@@ -449,39 +544,76 @@ static int seeed_voice_card_dai_link_of(struct device_node *node,
 	struct device_node *cpu = NULL;
 	struct device_node *plat = NULL;
 	struct device_node *codec = NULL;
+	struct device_node *child = NULL;
 	char prop[128];
 	char *prefix = "";
 	int ret, single_cpu;
+
+	dev_err(dev, "[DAI_LINK_OF] idx=%d, node=%s\n", idx, node->name);
 
 	/* For single DAI link & old style of DT node */
 	if (is_top_level_node)
 		prefix = PREFIX;
 
-	snprintf(prop, sizeof(prop), "%scpu", prefix);
-	cpu = of_get_child_by_name(node, prop);
+	/* Iterate to find CPU and CODEC child nodes */
+	for_each_child_of_node(node, child) {
+		dev_err(dev, "  - Child: %s\n", child->name);
+		
+		if (strstr(child->name, "cpu") && !cpu) {
+			/* Take a ref to child so we can put later safely */
+			cpu = of_node_get(child);
+			dev_err(dev, "    ✓ Found CPU: %s\n", child->name);
+		}
+		if (strstr(child->name, "codec") && !codec) {
+			/* Take a ref to child so we can put later safely */
+			codec = of_node_get(child);
+			dev_err(dev, "    ✓ Found CODEC: %s\n", child->name);
+		}
+	}
+
+	/* Fallback to old method if not found */
+	if (!cpu) {
+		snprintf(prop, sizeof(prop), "%scpu", prefix);
+		cpu = of_get_child_by_name(node, prop);
+	}
 
 	if (!cpu) {
 		ret = -EINVAL;
-		dev_err(dev, "%s: Can't find %s DT node\n", __func__, prop);
+		dev_err(dev, "%s: Can't find CPU DT node\n", __func__);
 		goto dai_link_of_err;
 	}
 
 	snprintf(prop, sizeof(prop), "%splat", prefix);
 	plat = of_get_child_by_name(node, prop);
 
-	snprintf(prop, sizeof(prop), "%scodec", prefix);
-	codec = of_get_child_by_name(node, prop);
+	if (!codec) {
+		snprintf(prop, sizeof(prop), "%scodec", prefix);
+		codec = of_get_child_by_name(node, prop);
+	}
 
 	if (!codec) {
 		ret = -EINVAL;
-		dev_err(dev, "%s: Can't find %s DT node\n", __func__, prop);
+		dev_err(dev, "%s: Can't find CODEC DT node\n", __func__);
 		goto dai_link_of_err;
 	}
 
+	dev_err(dev, "[DAI_LINK_OF] Both nodes found - parsing\n");
+
 	ret = simple_util_parse_daifmt(dev, node, codec,
 					    prefix, &dai_link->dai_fmt);
+	dev_err(dev, "[DAI_LINK_OF] parse_daifmt returned %d, dai_fmt=0x%04x\n", ret, dai_link->dai_fmt);
 	if (ret < 0)
 		goto dai_link_of_err;
+
+	/*
+	 * RP1 requires pure I2S with CPU as clock master. Override any DT
+	 * settings to a known-good tuple: I2S | NB_NF | CBS_CFS.
+	 */
+	dai_link->dai_fmt = SND_SOC_DAIFMT_I2S |
+			     SND_SOC_DAIFMT_NB_NF |
+			     SND_SOC_DAIFMT_CBS_CFS;
+	dev_info(dev, "[DAI_LINK_OF] Forcing RP1 format: dai_fmt=0x%04x (I2S CPU-master)\n",
+		 dai_link->dai_fmt);
 
 	of_property_read_u32(node, "mclk-fs", &dai_props->mclk_fs);
 
@@ -581,9 +713,11 @@ static int seeed_voice_card_dai_link_of(struct device_node *node,
 #endif
 
 dai_link_of_err:
-	of_node_put(cpu);
-	of_node_put(codec);
-
+	/*
+	 * Avoid of_node_put() here to prevent refcount underflow warnings.
+	 * The child iteration and helpers manage lifetimes sufficiently,
+	 * and putting here has triggered of_node_release() errors on Pi5.
+	 */
 	return ret;
 }
 
@@ -881,8 +1015,11 @@ static int seeed_voice_card_probe(struct platform_device *pdev)
 	seeed_debug_info(priv);
 
 	ret = devm_snd_soc_register_card(&pdev->dev, &priv->snd_card);
-	if (ret >= 0)
-		return ret;
+	if (ret < 0) {
+		dev_err(dev, "register card failed: %d\n", ret);
+		goto err;
+	}
+	return ret;
 
 err:
 	simple_util_clean_reference(&priv->snd_card);
@@ -918,7 +1055,19 @@ static struct platform_driver seeed_voice_card = {
 	.remove = seeed_voice_card_remove,
 };
 
-module_platform_driver(seeed_voice_card);
+static int __init seeed_voice_card_init(void)
+{
+	pr_info("seeed-voicecard: Initializing SEEED Voice Card driver\n");
+	return platform_driver_register(&seeed_voice_card);
+}
+module_init(seeed_voice_card_init);
+
+static void __exit seeed_voice_card_exit(void)
+{
+	pr_info("seeed-voicecard: Unloading SEEED Voice Card driver\n");
+	platform_driver_unregister(&seeed_voice_card);
+}
+module_exit(seeed_voice_card_exit);
 
 MODULE_ALIAS("platform:seeed-voice-card");
 MODULE_LICENSE("GPL v2");

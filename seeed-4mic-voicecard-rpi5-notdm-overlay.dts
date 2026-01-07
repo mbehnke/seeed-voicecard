@@ -1,0 +1,26 @@
+/dts-v1/;
+/plugin/;
+
+/ {
+	compatible = "brcm,bcm2708", "brcm,bcm2835", "brcm,bcm2836", "brcm,bcm2837", "brcm,bcm2711", "brcm,bcm2712";
+
+	fragment@0 {
+		target-path = "/sound/simple-audio-card,cpu";
+		__overlay__ {
+			/delete-property/ dai-tdm-slot-num;
+			/delete-property/ dai-tdm-slot-width;
+			/delete-property/ dai-tdm-slot-tx-mask;
+			/delete-property/ dai-tdm-slot-rx-mask;
+		};
+	};
+
+	fragment@1 {
+		target-path = "/sound/simple-audio-card,codec";
+		__overlay__ {
+			/delete-property/ dai-tdm-slot-num;
+			/delete-property/ dai-tdm-slot-width;
+			/delete-property/ dai-tdm-slot-tx-mask;
+			/delete-property/ dai-tdm-slot-rx-mask;
+		};
+	};
+};

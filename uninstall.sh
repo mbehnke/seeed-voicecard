@@ -52,7 +52,7 @@ do_overlay() {
     fi
 }
 
-RPI_HATS="seeed-2mic-voicecard seeed-4mic-voicecard seeed-8mic-voicecard"
+RPI_HATS="seeed-2mic-voicecard seeed-4mic-voicecard seeed-4mic-voicecard-rpi5 seeed-8mic-voicecard"
 
 PATH=$PATH:/opt/vc/bin
 echo "remove dtbos"
@@ -64,6 +64,7 @@ OVERLAYS=/boot/overlays
 
 rm  ${OVERLAYS}/seeed-2mic-voicecard.dtbo || true
 rm  ${OVERLAYS}/seeed-4mic-voicecard.dtbo || true
+rm  ${OVERLAYS}/seeed-4mic-voicecard-rpi5.dtbo || true
 rm  ${OVERLAYS}/seeed-8mic-voicecard.dtbo || true
 
 echo "remove alsa configs"
@@ -93,6 +94,14 @@ for i in $RPI_HATS; do
     echo Uninstall $i ...
     do_overlay $i 1
 done
+
+# remove any merge-note/commented lines added by install.sh
+sed -i '/seeed-4mic-voicecard-rpi5/d' "$CONFIG" || true
+
+# remove module autoload lines
+sed -i '/^snd-soc-seeed-voicecard$/d' /etc/modules || true
+sed -i '/^snd-soc-ac108$/d' /etc/modules || true
+sed -i '/^snd-soc-wm8960$/d' /etc/modules || true
 
 echo "------------------------------------------------------"
 echo "Please reboot your raspberry pi to apply all settings"

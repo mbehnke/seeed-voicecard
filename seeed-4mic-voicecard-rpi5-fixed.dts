@@ -1,0 +1,75 @@
+/dts-v1/;
+/plugin/;
+
+/ {
+	compatible = "brcm,bcm2708", "brcm,bcm2835", "brcm,bcm2836", "brcm,bcm2837", "brcm,bcm2711", "brcm,bcm2712";
+
+	fragment@0 {
+		target = <&i2s>;
+		__overlay__ {
+			status = "okay";
+		};
+	};
+
+	fragment@1 {
+		target-path = "/";
+		__overlay__ {
+			ac108_mclk: codec-mclk {
+				compatible = "fixed-clock";
+				#clock-cells = <0>;
+				clock-frequency = <24000000>;
+			};  
+		};
+	};
+
+	fragment@2 {
+		target = <&i2c1>;
+		__overlay__ {
+			#address-cells = <1>;
+			#size-cells = <0>;
+			status = "okay";
+
+			ac108_a: ac108@3b{
+				compatible = "x-power,ac108_0";
+				reg = <0x3b>;
+				#sound-dai-cells = <0>;
+				data-protocol = <0>;
+			};
+		};
+	};
+
+	fragment@3 {
+		target-path = "/";
+		__overlay__ {
+			sound_card: sound {
+				compatible = "seeed-voicecard";
+				seeed-voice-card,format = "i2s";
+				seeed-voice-card,name = "seeed-4mic-voicecard"; 
+				status = "okay";
+				// RPi 5 designware-i2s requires CPU as clock master
+				seeed-voice-card,bitclock-master = <&i2s>;
+				seeed-voice-card,frame-master = <&i2s>;
+				seeed-voice-card,channels-playback-override = <4>;
+				seeed-voice-card,channels-capture-override = <4>;
+
+				cpu_dai: seeed-voice-card,cpu {
+					sound-dai = <&i2s>;
+					/* TDM slot configuration for 4-channel audio */
+					/* BCLK ratio = slots * width = 4 * 32 = 128 */
+					dai-tdm-slot-num = <4>;
+					dai-tdm-slot-width = <32>;
+				};
+
+				codec_dai: seeed-voice-card,codec {
+					sound-dai = <&ac108_a>;
+					clocks = <&ac108_mclk>;
+					clock-names = "mclk";
+				};
+			};
+		};
+	};
+
+	__overrides__ {
+		card-name = <&sound_card>,"seeed-voice-card,name";
+	};
+};
